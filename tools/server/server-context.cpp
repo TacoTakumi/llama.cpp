@@ -909,6 +909,10 @@ private:
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
 
+    // set to llama_memory_seq_rm_align(memory)
+    // > 1 when the memory only supports partial removal at aligned positions
+    llama_pos n_seq_rm_align = 1;
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -1238,6 +1242,8 @@ private:
         }
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+
+        n_seq_rm_align = llama_memory_seq_rm_align(llama_get_memory(ctx_tgt));
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -3219,6 +3225,20 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                            }
+
+                            // the memory may only support partial removal at aligned positions
+                            // (e.g. DSV4 compressed-cache rollback works on block boundaries) -
+                            // on a divergent turn, align the reuse point down so the upcoming
+                            // removal [pos_next, end) lands on a supported boundary
+                            if (n_seq_rm_align > 1 && n_past < slot.prompt.n_tokens()) {
+                                const int n_past_aligned = (n_past/n_seq_rm_align)*n_seq_rm_align;
+
+                                if (n_past_aligned < n_past) {
+                                    SLT_DBG(slot, "aligning n_past %d -> %d (seq_rm_align = %d)\n", n_past, n_past_aligned, (int) n_seq_rm_align);
+
+                                    n_past = n_past_aligned;
+                                }
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);

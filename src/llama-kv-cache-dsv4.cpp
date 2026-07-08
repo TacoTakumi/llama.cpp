@@ -1443,10 +1443,54 @@ llama_pos llama_kv_cache_dsv4::seq_pos_min(llama_seq_id seq_id) const {
         return -1;
     }
 
-    // The raw SWA cache may contain a wider window, but the compressed DSV4
-    // state cannot be rolled back within that window. Report only the current
-    // boundary so server-context uses checkpoints for rollback.
-    return kv_raw->seq_pos_max(seq_id);
+    const llama_pos pos_max = kv_raw->seq_pos_max(seq_id);
+    if (pos_max < 0) {
+        return -1;
+    }
+
+    // Rollback floor: the lowest block-aligned p0 that seq_rm would accept.
+    // Both constraints from the rollback branch of seq_rm apply:
+    //  - an as-of-p0 ring snapshot must exist (snapshots are recorded per
+    //    crossed boundary and form a contiguous run below the tip), and
+    //  - the raw SWA window must still cover the re-decode window
+    //    [p0 - n_swa + 1, p0).
+    llama_pos floor = -1;
+
+    if (hist_slots > 0) {
+        const uint32_t strm = csa_state->get_n_stream() > 1 ? (uint32_t) seq_id : 0;
+
+        llama_pos boundary_min = -1;
+        for (uint32_t slot = 0; slot < hist_slots; ++slot) {
+            const llama_pos b = hist_boundary[(size_t) strm*hist_slots + slot];
+            if (b >= 0 && b <= pos_max && (boundary_min < 0 || b < boundary_min)) {
+                boundary_min = b;
+            }
+        }
+
+        const llama_pos swa_min = kv_raw->get_swa()->seq_pos_min(seq_id);
+
+        if (boundary_min >= 0 && swa_min >= 0) {
+            const llama_pos block = (llama_pos) DSV4_ROLLBACK_BLOCK;
+            const llama_pos raw_min = ((swa_min + (llama_pos) hparams_raw.n_swa - 1 + block - 1)/block)*block;
+
+            floor = std::max(boundary_min, raw_min);
+            if (floor > pos_max) {
+                floor = -1;
+            }
+        }
+    }
+
+    if (floor < 0) {
+        // No supported rollback target: report the current boundary so
+        // server-context routes divergences to checkpoints.
+        return pos_max;
+    }
+
+    // A re-decode from the floor reads raw positions down to floor - n_swa + 1.
+    // Report one position below that window so the server's generic
+    // `pos_min >= pos_next - n_swa` checkpoint test takes the partial-reuse
+    // path exactly when seq_rm would accept the rollback (pos_next >= floor).
+    return std::max<llama_pos>(0, floor - (llama_pos) hparams_raw.n_swa - 1);
 }
 
 llama_pos llama_kv_cache_dsv4::seq_pos_max(llama_seq_id seq_id) const {
@@ -1455,6 +1499,10 @@ llama_pos llama_kv_cache_dsv4::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return kv_raw->seq_pos_max(seq_id);
+}
+
+llama_pos llama_kv_cache_dsv4::seq_rm_align() const {
+    return hist_slots > 0 ? (llama_pos) DSV4_ROLLBACK_BLOCK : 1;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdown() const {

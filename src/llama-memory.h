@@ -116,6 +116,9 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // position alignment required for the p0 of a partial seq_rm (1 = any position)
+    virtual llama_pos seq_rm_align() const { return 1; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

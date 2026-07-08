@@ -3899,6 +3899,14 @@ llama_pos llama_memory_seq_pos_max(
     return mem->seq_pos_max(seq_id);
 }
 
+llama_pos llama_memory_seq_rm_align(llama_memory_t mem) {
+    if (!mem) {
+        return 1;
+    }
+
+    return mem->seq_rm_align();
+}
+
 bool llama_memory_can_shift(llama_memory_t mem) {
     if (!mem) {
         return false;

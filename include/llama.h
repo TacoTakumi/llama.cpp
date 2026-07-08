@@ -778,6 +778,11 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Returns the position alignment required for the p0 of a partial llama_memory_seq_rm()
+    // 1 = removal is supported starting from any position
+    // e.g. compressed KV caches may only support removal at block-aligned positions
+    LLAMA_API llama_pos llama_memory_seq_rm_align(llama_memory_t mem);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
