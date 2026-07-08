@@ -18,6 +18,11 @@
 static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
+// Tail rollbacks land on HCA block boundaries: the HCA ring then rebuilds
+// fully from the re-decode before its next block commit reads it, so only the
+// CSA/LID rings need an as-of-boundary snapshot history.
+static constexpr uint32_t DSV4_ROLLBACK_BLOCK = DSV4_HCA_RATIO;
+
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
@@ -378,7 +383,8 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         bool overlap,
         uint32_t state_size,
         uint32_t kv_size,
-        uint32_t n_stream) {
+        uint32_t n_stream,
+        uint32_t hist_slots) {
     llama_kv_cache_dsv4_context::comp_plan plan;
     plan.n_visible.resize(ubatch.n_tokens);
     plan.n_stream = dsv4_comp_graph_n_stream(ubatch, n_stream);
@@ -461,6 +467,23 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                 it->pos = pos;
             }
 
+            if (hist_slots > 0 && (pos + 1) % (llama_pos) DSV4_ROLLBACK_BLOCK == 0) {
+                // Snapshot the ring rows as of this boundary: positions
+                // boundary-state_size..boundary-1 land on rows 0..state_size-1
+                // because DSV4_ROLLBACK_BLOCK is a multiple of state_size.
+                const llama_pos boundary  = pos + 1;
+                const int64_t   hist_rows = (int64_t) (hist_slots + 1)*state_size;
+                const int64_t   hist_off  = dsv4_stream_offset(n_stream, seq_id, (uint32_t) hist_rows);
+                const int64_t   slot      = (boundary/DSV4_ROLLBACK_BLOCK) % hist_slots;
+
+                for (uint32_t j = 0; j < state_size; ++j) {
+                    const llama_pos p = boundary - (llama_pos) state_size + j;
+                    GGML_ASSERT(p >= 0);
+                    plan.hist_read_idxs .push_back(state_source_idx(seq_id, p));
+                    plan.hist_write_idxs.push_back((int32_t) (hist_off + slot*state_size + j));
+                }
+            }
+
             if ((pos + 1) % ratio != 0) {
                 continue;
             }
@@ -519,6 +542,26 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         }
     }
 
+    if (hist_slots > 0 && plan.hist_write_idxs.empty() && !plan.state_pos.empty()) {
+        // Non-boundary steps write a dump group so their graph matches
+        // boundary steps.
+        uint32_t i = 0;
+        while (i < ubatch.n_tokens && ubatch.pos[i] < 0) {
+            ++i;
+        }
+        assert(i < ubatch.n_tokens);
+
+        const llama_seq_id seq_id     = ubatch.seq_id[i][0];
+        const int32_t      source_idx = state_source_idx(seq_id, ubatch.pos[i]);
+        const int64_t      hist_rows  = (int64_t) (hist_slots + 1)*state_size;
+        const int64_t      hist_off   = dsv4_stream_offset(n_stream, seq_id, (uint32_t) hist_rows);
+
+        for (uint32_t j = 0; j < state_size; ++j) {
+            plan.hist_read_idxs .push_back(source_idx);
+            plan.hist_write_idxs.push_back((int32_t) (hist_off + (int64_t) hist_slots*state_size + j));
+        }
+    }
+
     if (overlap) {
         // [ all blocks' prev-window indices | all blocks' cur-window indices ]
         plan.state_read_idxs.reserve(overlap_prev_reads.size() + overlap_cur_reads.size());
@@ -561,12 +604,13 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
         bool overlap,
         uint32_t state_size,
         uint32_t kv_size,
-        uint32_t n_stream) {
+        uint32_t n_stream,
+        uint32_t hist_slots) {
     std::vector<llama_kv_cache_dsv4_context::comp_plan> plans;
     plans.reserve(ubatches.size());
 
     for (const llama_ubatch & ubatch : ubatches) {
-        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream));
+        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, hist_slots));
     }
 
     return plans;
@@ -653,7 +697,8 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
         bool overlap,
         uint32_t state_size,
         uint32_t kv_size,
-        uint32_t n_stream) {
+        uint32_t n_stream,
+        uint32_t hist_slots) {
     llama_kv_cache_dsv4_context::comp_plan plan;
     plan.n_visible.resize(ubatch.n_tokens);
     plan.n_stream = dsv4_comp_graph_n_stream(ubatch, n_stream);
@@ -679,6 +724,14 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
     plan.state_write_idxs.resize(n_blocks);
     plan.state_write_pos .resize(n_blocks);
 
+    if (hist_slots > 0) {
+        const size_t n_bounds = (size_t) std::max<uint64_t>(1,
+                (uint64_t) n_seqs*((n_seq_tokens + DSV4_ROLLBACK_BLOCK - 1)/DSV4_ROLLBACK_BLOCK));
+
+        plan.hist_read_idxs .resize(state_size*n_bounds);
+        plan.hist_write_idxs.resize(state_size*n_bounds);
+    }
+
     return plan;
 }
 
@@ -700,13 +753,17 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
             uint32_t        ratio,
             uint32_t        state_size,
             uint32_t        n_embd_state,
+            uint32_t        hist_slots,
         const char    * name,
         const llama_memory_i::layer_filter_cb & filter) :
     ratio(ratio),
     state_size(state_size),
     n_embd_state(n_embd_state),
-    n_stream(unified ? 1 : n_seq_max) {
+    n_stream(unified ? 1 : n_seq_max),
+    hist_slots(hist_slots) {
     const llama_hparams & hparams = model.hparams;
+
+    GGML_ASSERT(hist_slots == 0 || DSV4_ROLLBACK_BLOCK % state_size == 0);
 
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
@@ -720,7 +777,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*hparams.n_layer()*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream) + 2u)*hparams.n_layer()*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -775,9 +832,21 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
             score_stream.push_back(ggml_view_2d(ctx, score, n_embd_state, state_size, score->nb[1], s*score->nb[2]));
         }
 
+        ggml_tensor * hist_kv    = nullptr;
+        ggml_tensor * hist_score = nullptr;
+        if (hist_slots > 0) {
+            const int64_t hist_rows = (int64_t) (hist_slots + 1)*state_size;
+
+            hist_kv    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_state, hist_rows, n_stream);
+            hist_score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_state, hist_rows, n_stream);
+
+            ggml_format_name(hist_kv,    "dsv4_%s_hist_kv_l%d",    name, il);
+            ggml_format_name(hist_score, "dsv4_%s_hist_score_l%d", name, il);
+        }
+
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, kv, score, std::move(kv_stream), std::move(score_stream) });
+        layers.push_back({ il, kv, score, std::move(kv_stream), std::move(score_stream), hist_kv, hist_score });
     }
 
     for (auto & [buft, ctx] : ctx_map) {
@@ -851,6 +920,10 @@ uint32_t llama_dsv4_comp_state::get_state_size() const {
 
 uint32_t llama_dsv4_comp_state::get_n_stream() const {
     return n_stream;
+}
+
+uint32_t llama_dsv4_comp_state::get_hist_slots() const {
+    return hist_slots;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_dsv4_comp_state::memory_breakdown() const {
@@ -951,6 +1024,55 @@ ggml_tensor * llama_dsv4_comp_state::cpy_kv(ggml_context * ctx, ggml_tensor * cu
 
 ggml_tensor * llama_dsv4_comp_state::cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const {
     return ggml_set_rows(ctx, get_score(ctx, il), cur, idxs);
+}
+
+ggml_tensor * llama_dsv4_comp_state::get_hist_kv(ggml_context * ctx, int32_t il) const {
+    const int32_t ids = map_layer_ids.at(il);
+
+    ggml_tensor * hist = layers[ids].hist_kv;
+    GGML_ASSERT(hist);
+
+    return ggml_reshape_2d(ctx, hist, hist->ne[0], hist->ne[1]*hist->ne[2]);
+}
+
+ggml_tensor * llama_dsv4_comp_state::get_hist_score(ggml_context * ctx, int32_t il) const {
+    const int32_t ids = map_layer_ids.at(il);
+
+    ggml_tensor * hist = layers[ids].hist_score;
+    GGML_ASSERT(hist);
+
+    return ggml_reshape_2d(ctx, hist, hist->ne[0], hist->ne[1]*hist->ne[2]);
+}
+
+ggml_tensor * llama_dsv4_comp_state::cpy_hist_kv(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const {
+    return ggml_set_rows(ctx, get_hist_kv(ctx, il), cur, idxs);
+}
+
+ggml_tensor * llama_dsv4_comp_state::cpy_hist_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const {
+    return ggml_set_rows(ctx, get_hist_score(ctx, il), cur, idxs);
+}
+
+void llama_dsv4_comp_state::hist_restore(llama_seq_id seq_id, uint32_t slot) {
+    GGML_ASSERT(hist_slots > 0 && slot < hist_slots);
+    GGML_ASSERT(seq_id >= 0);
+
+    const uint32_t strm = n_stream > 1 ? (uint32_t) seq_id : 0;
+    GGML_ASSERT(strm < n_stream);
+
+    const size_t row_size  = ggml_row_size(GGML_TYPE_F32, n_embd_state);
+    const size_t n_bytes   = (size_t) state_size*row_size;
+    const size_t off_state = (size_t) strm*state_size*row_size;
+    const size_t off_hist  = ((size_t) strm*(hist_slots + 1) + slot)*state_size*row_size;
+
+    std::vector<uint8_t> buf(n_bytes);
+
+    for (const auto & layer : layers) {
+        ggml_backend_tensor_get(layer.hist_kv, buf.data(), off_hist, n_bytes);
+        ggml_backend_tensor_set(layer.kv,      buf.data(), off_state, n_bytes);
+
+        ggml_backend_tensor_get(layer.hist_score, buf.data(), off_hist, n_bytes);
+        ggml_backend_tensor_set(layer.score,      buf.data(), off_state, n_bytes);
+    }
 }
 
 size_t llama_dsv4_comp_state::total_size() const {
@@ -1062,23 +1184,30 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
-    LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
+    // Ring-snapshot history: one slot per rollback block the raw SWA window
+    // can cover, plus margin. The HCA ring rebuilds from an aligned re-decode,
+    // so only the CSA/LID states carry history planes.
+    hist_slots = kv_raw->get_swa()->get_size()/DSV4_ROLLBACK_BLOCK + 2;
+
+    LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state, rollback history slots = %u\n", __func__, hist_slots);
 
     csa_state = std::make_unique<llama_dsv4_comp_state>(
             model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
-            2*model.hparams.n_embd_head_k(), "csa", filter_csa);
+            2*model.hparams.n_embd_head_k(), hist_slots, "csa", filter_csa);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressor state\n", __func__);
 
     hca_state = std::make_unique<llama_dsv4_comp_state>(
             model, offload, unified_compressed, n_seq_max, DSV4_HCA_RATIO, DSV4_HCA_RATIO,
-            model.hparams.n_embd_head_k(), "hca", filter_hca);
+            model.hparams.n_embd_head_k(), 0, "hca", filter_hca);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer compressor state\n", __func__);
 
     lid_state = std::make_unique<llama_dsv4_comp_state>(
             model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
-            2*model.hparams.indexer_head_size, "lid", filter_csa);
+            2*model.hparams.indexer_head_size, hist_slots, "lid", filter_csa);
+
+    hist_boundary.assign((size_t) csa_state->get_n_stream()*hist_slots, -1);
 
     // DSV4 attention reads compressed-K / compressor-state rows that the current
     // graph does not necessarily overwrite; uninitialized buffer contents would
@@ -1212,19 +1341,56 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     }
 
     if (p0 > 0) {
-        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max ||
-                p0 <= kv_raw->seq_pos_max(seq_id)) {
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
             return false;
         }
 
-        bool res = true;
+        // dead tail past the end of the sequence: propagate to all caches
+        if (p0 > kv_raw->seq_pos_max(seq_id)) {
+            bool res = true;
 
-        res = res & kv_raw->seq_rm(seq_id, p0, -1);
-        res = res & kv_csa->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
-        res = res & kv_hca->seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1);
-        res = res & kv_lid->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+            res = res & kv_raw->seq_rm(seq_id, p0, -1);
+            res = res & kv_csa->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+            res = res & kv_hca->seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1);
+            res = res & kv_lid->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
 
-        return res;
+            return res;
+        }
+
+        // Evict the 1-token tail so the last-token re-eval doesn't duplicate it; deeper rollbacks go to a checkpoint.
+        if (p0 == kv_raw->seq_pos_max(seq_id)) {
+            return kv_raw->seq_rm(seq_id, p0, p1);
+        }
+
+        // Block-aligned tail rollback, supported when an as-of-p0 ring
+        // snapshot exists and the raw SWA window still covers the re-decode
+        // window [p0 - n_swa + 1, p0). Purging the raw tail keeps find_slot's
+        // no-futures invariant; stale compressed rows above p0 stay masked
+        // (n_visible) until the re-decode rewrites them, and the HCA ring
+        // rebuilds fully before its next block commit because p0 is aligned
+        // to the HCA block size.
+        if (hist_slots > 0 && p0 % (llama_pos) DSV4_ROLLBACK_BLOCK == 0) {
+            const uint32_t strm = csa_state->get_n_stream() > 1 ? (uint32_t) seq_id : 0;
+            const uint32_t slot = (uint32_t) (p0/DSV4_ROLLBACK_BLOCK) % hist_slots;
+
+            const bool have_snapshot = hist_boundary[(size_t) strm*hist_slots + slot] == p0;
+
+            const llama_pos swa_min = kv_raw->get_swa()->seq_pos_min(seq_id);
+            const bool raw_ok = swa_min >= 0 && p0 - (llama_pos) (hparams_raw.n_swa - 1) >= swa_min;
+
+            if (have_snapshot && raw_ok) {
+                if (!kv_raw->seq_rm(seq_id, p0, p1)) {
+                    return false;
+                }
+
+                csa_state->hist_restore(seq_id, slot);
+                lid_state->hist_restore(seq_id, slot);
+
+                return true;
+            }
+        }
+
+        return false;
     }
 
     const bool res = kv_raw->seq_rm(seq_id, p0, p1);
@@ -1375,6 +1541,9 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     hca_state->state_read(io, seq_id, flags);
     lid_state->state_read(io, seq_id, flags);
 
+    // The restored blob may describe a different branch than the snapshots;
+    // drop them and let decode re-arm the rollback floor.
+    hist_invalidate();
 }
 
 llama_kv_cache_iswa * llama_kv_cache_dsv4::get_raw() const {
@@ -1431,6 +1600,39 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
     csa_state->clear(seq_id, data);
     hca_state->clear(seq_id, data);
     lid_state->clear(seq_id, data);
+
+    // Boundary snapshots are only trusted while the compressed rings they
+    // mirror are intact; dropping them here just routes the next rollback to
+    // the checkpoint path.
+    hist_invalidate();
+}
+
+void llama_kv_cache_dsv4::hist_record(const llama_ubatch & ubatch) {
+    if (hist_slots == 0) {
+        return;
+    }
+
+    const uint32_t n_stream = csa_state->get_n_stream();
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const llama_pos pos = ubatch.pos[i];
+
+        if (pos < 0 || (pos + 1) % (llama_pos) DSV4_ROLLBACK_BLOCK != 0) {
+            continue;
+        }
+
+        const uint32_t slot = (uint32_t) ((pos + 1)/DSV4_ROLLBACK_BLOCK) % hist_slots;
+
+        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+            const uint32_t strm = n_stream > 1 ? (uint32_t) ubatch.seq_id[i][s] : 0;
+
+            hist_boundary[(size_t) strm*hist_slots + slot] = pos + 1;
+        }
+    }
+}
+
+void llama_kv_cache_dsv4::hist_invalidate() {
+    std::fill(hist_boundary.begin(), hist_boundary.end(), -1);
 }
 
 //
@@ -1720,11 +1922,14 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         slot_info_vec_t sinfos_raw_swa_read,
         std::vector<llama_ubatch> ubatches,
         std::vector<llama_ubatch> ubatches_raw) :
+    kv_parent(kv),
     ubatches(std::move(ubatches)),
     plans_csa(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
-                kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream())),
+                kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
+                kv->get_csa_state()->get_hist_slots())),
     plans_hca(dsv4_build_comp_plans(this->ubatches, DSV4_HCA_RATIO, false,
-                kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream())),
+                kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream(),
+                kv->get_hca_state()->get_hist_slots())),
     plans_lid(plans_csa),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
                 kv->get_raw(),
@@ -1788,6 +1993,10 @@ bool llama_kv_cache_dsv4_context::apply() {
         csa_state->apply_copies(sc_info_csa);
         hca_state->apply_copies(sc_info_hca);
         lid_state->apply_copies(sc_info_lid);
+    }
+
+    if (res && kv_parent && i_next < ubatches.size()) {
+        kv_parent->hist_record(ubatches[i_next]);
     }
 
     return res;
@@ -1887,7 +2096,8 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
 
     reserve_plan_csa = dsv4_build_reserve_comp_plan(
             ubatch, DSV4_CSA_RATIO, true,
-            csa_state->get_state_size(), get_csa()->get_n_kv(), csa_state->get_n_stream());
+            csa_state->get_state_size(), get_csa()->get_n_kv(), csa_state->get_n_stream(),
+            csa_state->get_hist_slots());
 
     return reserve_plan_csa;
 }
@@ -1901,7 +2111,8 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
 
     reserve_plan_hca = dsv4_build_reserve_comp_plan(
             ubatch, DSV4_HCA_RATIO, false,
-            hca_state->get_state_size(), get_hca()->get_n_kv(), hca_state->get_n_stream());
+            hca_state->get_state_size(), get_hca()->get_n_kv(), hca_state->get_n_stream(),
+            hca_state->get_hist_slots());
 
     return reserve_plan_hca;
 }
@@ -1915,7 +2126,8 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
 
     reserve_plan_lid = dsv4_build_reserve_comp_plan(
             ubatch, DSV4_CSA_RATIO, true,
-            lid_state->get_state_size(), get_lid()->get_n_kv(), lid_state->get_n_stream());
+            lid_state->get_state_size(), get_lid()->get_n_kv(), lid_state->get_n_stream(),
+            lid_state->get_hist_slots());
 
     return reserve_plan_lid;
 }

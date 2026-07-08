@@ -22,6 +22,7 @@ public:
             uint32_t        ratio,
             uint32_t        state_size,
             uint32_t        n_embd_state,
+            uint32_t        hist_slots,
             const char    * name,
         const llama_memory_i::layer_filter_cb & filter);
 
@@ -32,6 +33,7 @@ public:
     uint32_t get_ratio()    const;
     uint32_t get_state_size() const;
     uint32_t get_n_stream() const;
+    uint32_t get_hist_slots() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -44,6 +46,17 @@ public:
     ggml_tensor * cpy_kv   (ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
     ggml_tensor * cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
 
+    // as-of-boundary ring-snapshot history (tail-rollback support); per stream
+    // the planes hold hist_slots groups of state_size rows plus one dump group
+    ggml_tensor * get_hist_kv   (ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_hist_score(ggml_context * ctx, int32_t il) const;
+
+    ggml_tensor * cpy_hist_kv   (ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
+    ggml_tensor * cpy_hist_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
+
+    // copy one history slot back over the live ring state (host-side, small)
+    void hist_restore(llama_seq_id seq_id, uint32_t slot);
+
 private:
     struct layer {
         uint32_t il;
@@ -53,12 +66,16 @@ private:
 
         std::vector<ggml_tensor *> kv_stream;
         std::vector<ggml_tensor *> score_stream;
+
+        ggml_tensor * hist_kv;
+        ggml_tensor * hist_score;
     };
 
     const uint32_t ratio;
     const uint32_t state_size;
     const uint32_t n_embd_state;
     const uint32_t n_stream;
+    const uint32_t hist_slots;
 
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
@@ -141,6 +158,11 @@ public:
     llama_dsv4_comp_state * get_hca_state() const;
     llama_dsv4_comp_state * get_lid_state() const;
 
+    // tail-rollback snapshot bookkeeping: record the boundaries a committed
+    // ubatch crosses; seq_rm consults them before accepting a tail rollback
+    void hist_record(const llama_ubatch & ubatch);
+    void hist_invalidate();
+
 private:
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
@@ -156,6 +178,11 @@ private:
     std::unique_ptr<llama_dsv4_comp_state> csa_state;
     std::unique_ptr<llama_dsv4_comp_state> hca_state;
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
+
+    // boundary position captured per (stream, slot) of the CSA/LID history
+    // planes; -1 = empty
+    uint32_t hist_slots = 0;
+    std::vector<llama_pos> hist_boundary;
 
     void clear_compressed(llama_seq_id seq_id, bool data);
 };
@@ -282,6 +309,12 @@ public:
         // RoPE positions for state-backed commits.
         std::vector<int32_t> state_write_pos;
 
+        // As-of-boundary ring-snapshot gathers for tail-rollback support.
+        // Sources index the graph-local [persistent_state | current_ubatch]
+        // tensor like state_read_idxs; destinations are history-plane rows.
+        std::vector<int32_t> hist_read_idxs;
+        std::vector<int32_t> hist_write_idxs;
+
         // Number of completed compressed rows visible for each query token.
         std::vector<int32_t> n_visible;
 
@@ -348,6 +381,9 @@ public:
 
 private:
     size_t i_next = 0;
+
+    // parent cache for hist_record() at apply() time; only set for batch contexts
+    llama_kv_cache_dsv4 * kv_parent = nullptr;
 
     std::vector<llama_ubatch> ubatches;
 

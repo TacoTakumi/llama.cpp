@@ -905,6 +905,17 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(ctx0,
                     kv_comp_csa_state, inp_dsv4->get_csa().state_write_idxs, il));
 
+        if (inp_dsv4->get_csa().hist_read_idxs) {
+            // As-of-boundary ring snapshot for tail rollback (REQ-01/REQ-02).
+            ggml_tensor * csa_hist_kv    = ggml_get_rows(ctx0, csa_source_kv,    inp_dsv4->get_csa().hist_read_idxs);
+            ggml_tensor * csa_hist_score = ggml_get_rows(ctx0, csa_source_score, inp_dsv4->get_csa().hist_read_idxs);
+
+            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa_state()->cpy_hist_kv(ctx0,
+                        csa_hist_kv, inp_dsv4->get_csa().hist_write_idxs, il));
+            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa_state()->cpy_hist_score(ctx0,
+                        csa_hist_score, inp_dsv4->get_csa().hist_write_idxs, il));
+        }
+
         csa_state_kv    = dsv4_with_zero_dep(ctx0, csa_state_kv,    kv_comp_csa_state);
         csa_state_score = dsv4_with_zero_dep(ctx0, csa_state_score, kv_comp_csa_state);
 
@@ -956,6 +967,17 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
 
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
                     kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
+
+        if (inp_dsv4->get_lid().hist_read_idxs) {
+            // As-of-boundary ring snapshot for tail rollback (REQ-01/REQ-02).
+            ggml_tensor * lid_hist_kv    = ggml_get_rows(ctx0, lid_source_kv,    inp_dsv4->get_lid().hist_read_idxs);
+            ggml_tensor * lid_hist_score = ggml_get_rows(ctx0, lid_source_score, inp_dsv4->get_lid().hist_read_idxs);
+
+            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid_state()->cpy_hist_kv(ctx0,
+                        lid_hist_kv, inp_dsv4->get_lid().hist_write_idxs, il));
+            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid_state()->cpy_hist_score(ctx0,
+                        lid_hist_score, inp_dsv4->get_lid().hist_write_idxs, il));
+        }
 
         lid_state_kv    = dsv4_with_zero_dep(ctx0, lid_state_kv,    kv_comp_lid_state);
         lid_state_score = dsv4_with_zero_dep(ctx0, lid_state_score, kv_comp_lid_state);
