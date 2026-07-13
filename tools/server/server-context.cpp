@@ -3227,10 +3227,19 @@ private:
                                 n_past = 0;
                             }
 
+                            // [TAG_PROMPT_LOGITS]
+                            if (n_past == slot.task->n_tokens() && n_past > 0) {
+                                SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
+                                n_past--;
+                                SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                            }
+
                             // the memory may only support partial removal at aligned positions
                             // (e.g. DSV4 compressed-cache rollback works on block boundaries) -
-                            // on a divergent turn, align the reuse point down so the upcoming
-                            // removal [pos_next, end) lands on a supported boundary
+                            // align the reuse point down so the upcoming removal
+                            // [pos_next, end) lands on a supported boundary; this also covers
+                            // the full-prefix-match re-eval above, whose 1-token removal sits
+                            // at an arbitrary position the memory may not support
                             if (n_seq_rm_align > 1 && n_past < slot.prompt.n_tokens()) {
                                 const int n_past_aligned = (n_past/n_seq_rm_align)*n_seq_rm_align;
 
@@ -3243,11 +3252,11 @@ private:
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
-                            // ref: https://github.com/ggml-org/llama.cpp/pull/24110
-                            const bool has_new_tokens = (n_past < slot.task->n_tokens());
-
                             // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+                            // (n_past is already strictly below the task size here, so at least
+                            // one new token is always processed - ref:
+                            // https://github.com/ggml-org/llama.cpp/pull/24110)
+                            const auto pos_min_thold = std::max(0, pos_next - n_swa);
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -3350,13 +3359,6 @@ private:
                                     }
                                 }
                             }
-                        }
-
-                        // [TAG_PROMPT_LOGITS]
-                        if (n_past == slot.task->n_tokens() && n_past > 0) {
-                            SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-                            n_past--;
-                            SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
                         slot.n_prompt_tokens_cache = n_past;

@@ -1357,11 +1357,6 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return res;
         }
 
-        // Evict the 1-token tail so the last-token re-eval doesn't duplicate it; deeper rollbacks go to a checkpoint.
-        if (p0 == kv_raw->seq_pos_max(seq_id)) {
-            return kv_raw->seq_rm(seq_id, p0, p1);
-        }
-
         // Block-aligned tail rollback, supported when an as-of-p0 ring
         // snapshot exists and the raw SWA window still covers the re-decode
         // window [p0 - n_swa + 1, p0). Purging the raw tail keeps find_slot's
