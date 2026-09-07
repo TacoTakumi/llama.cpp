@@ -2,6 +2,7 @@
 
 #define CUDA_GET_ROWS_BLOCK_SIZE 256
 #define CUDA_GET_ROWS_BACK_BLOCK_SIZE 256
+#define CUDA_GET_ROWS_SMALL_NE00 64
 
 void get_rows_cuda(
         const void * src0_d, ggml_type src0_type, const int32_t * src1_d, void * dst_d, ggml_type dst_type,
