@@ -773,6 +773,25 @@ static void common_params_apply_system_config(common_params & params, llama_exam
     }
 }
 
+// number of devices a model load will use: the --device list if given, else the GPUs in the backend registry
+// (integrated GPUs only when there is no discrete GPU, like llama_model_load)
+static size_t get_n_model_devices(const common_params & params) {
+    if (!params.devices.empty()) {
+        return params.devices.size() - 1; // the list is nullptr-terminated
+    }
+    ggml_backend_load_all();
+    size_t n_gpu  = 0;
+    size_t n_igpu = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        switch (ggml_backend_dev_type(ggml_backend_dev_get(i))) {
+            case GGML_BACKEND_DEVICE_TYPE_GPU:  n_gpu++;  break;
+            case GGML_BACKEND_DEVICE_TYPE_IGPU: n_igpu++; break;
+            default: break;
+        }
+    }
+    return n_gpu > 0 ? n_gpu : n_igpu;
+}
+
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
 
@@ -905,6 +924,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
+    }
+
+    // a per-device MoE cache list is indexed by model device, so it must have one entry per device
+    if (params.moe_cache_per_device) {
+        const size_t n_dev = get_n_model_devices(params);
+        if (params.moe_cache_n_sizes != n_dev) {
+            throw std::invalid_argument(string_format(
+                "error: --moe-cache-mib: got %zu entries, expected %zu (one per device)\n", params.moe_cache_n_sizes, n_dev));
+        }
     }
 
     const bool skip_model_download =
@@ -2800,14 +2828,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
             auto parse_mib = [](const std::string & s) {
                 size_t idx = 0;
-                const int v = std::stoi(s, &idx);
+                int v = -1;
+                try {
+                    v = std::stoi(s, &idx);
+                } catch (const std::exception &) {
+                    idx = 0;
+                }
                 if (idx != s.size() || v < 0) {
-                    throw std::invalid_argument("invalid value");
+                    throw std::invalid_argument(string_format("invalid entry '%s'", s.c_str()));
                 }
                 return (size_t) v * 1024 * 1024;
             };
 
             params.moe_cache_size = 0;
+            params.moe_cache_n_sizes = split_arg.size();
             params.moe_cache_per_device = split_arg.size() > 1;
             for (size_t i = 0; i < llama_max_devices(); ++i) {
                 params.moe_cache_sizes[i] = 0;

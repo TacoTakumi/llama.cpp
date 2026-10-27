@@ -4,6 +4,7 @@
 #include "llama.h"
 #include "speculative.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -313,24 +314,73 @@ static void test(void) {
         assert(moe_params.moe_cache_sizes[0] == 0);
     }
 
+    // a per-device list must have one entry per device the model will use, which the parser takes from
+    // the backend registry (discrete GPUs, else integrated GPUs); count them the same way so the test
+    // does not depend on the machine it runs on
+    size_t n_gpu_devices = 0;
     {
+        ggml_backend_load_all();
+        size_t n_gpu  = 0;
+        size_t n_igpu = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            switch (ggml_backend_dev_type(ggml_backend_dev_get(i))) {
+                case GGML_BACKEND_DEVICE_TYPE_GPU:  n_gpu++;  break;
+                case GGML_BACKEND_DEVICE_TYPE_IGPU: n_igpu++; break;
+                default: break;
+            }
+        }
+        n_gpu_devices = n_gpu > 0 ? n_gpu : n_igpu;
+    }
+    // "16,32,48,..." with n entries
+    auto moe_cache_list = [](size_t n) {
+        std::string list;
+        for (size_t i = 0; i < n; ++i) {
+            list += (i > 0 ? "," : "") + std::to_string(16 * (i + 1));
+        }
+        return list;
+    };
+
+    if (n_gpu_devices >= 2) {
         common_params moe_params;
-        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", "16,32"};
+        const std::string list = moe_cache_list(n_gpu_devices);
+        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", list};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
         assert(moe_params.moe_cache_per_device == true);
-        assert(moe_params.moe_cache_sizes[0] == (size_t) 16 * 1024 * 1024);
-        assert(moe_params.moe_cache_sizes[1] == (size_t) 32 * 1024 * 1024);
-        assert(moe_params.moe_cache_size == (size_t) 48 * 1024 * 1024);
+        assert(moe_params.moe_cache_n_sizes == n_gpu_devices);
+        size_t total = 0;
+        for (size_t i = 0; i < n_gpu_devices; ++i) {
+            assert(moe_params.moe_cache_sizes[i] == (size_t) 16 * (i + 1) * 1024 * 1024);
+            total += moe_params.moe_cache_sizes[i];
+        }
+        assert(moe_params.moe_cache_sizes[n_gpu_devices] == 0);
+        assert(moe_params.moe_cache_size == total);
     }
 
-    {
+    if (n_gpu_devices >= 2) {
+        // zero entries are allowed
         common_params moe_params;
-        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", "0,16"};
+        const std::string list = "0" + moe_cache_list(n_gpu_devices).substr(2);
+        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", list};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
         assert(moe_params.moe_cache_per_device == true);
         assert(moe_params.moe_cache_sizes[0] == 0);
-        assert(moe_params.moe_cache_sizes[1] == (size_t) 16 * 1024 * 1024);
-        assert(moe_params.moe_cache_size == (size_t) 16 * 1024 * 1024);
+        assert(moe_params.moe_cache_sizes[1] == (size_t) 32 * 1024 * 1024);
+    }
+
+    {
+        // one entry too many
+        common_params moe_params;
+        const std::string list = moe_cache_list(std::max<size_t>(n_gpu_devices + 1, 2));
+        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", list};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    if (n_gpu_devices >= 3) {
+        // one entry too few
+        common_params moe_params;
+        const std::string list = moe_cache_list(n_gpu_devices - 1);
+        argv = {"binary_name", "-m", "dummy.gguf", "--moe-cache-mib", list};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
     }
 
     {
@@ -340,8 +390,16 @@ static void test(void) {
     }
 
     {
+        // a non-number entry is rejected by the parser before the device count is checked
         common_params moe_params;
         argv = {"binary_name", "--moe-cache-mib", "16,foo"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    if (n_gpu_devices >= 2) {
+        common_params moe_params;
+        const std::string list = "x" + moe_cache_list(n_gpu_devices).substr(2);
+        argv = {"binary_name", "--moe-cache-mib", list};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
     }
 
