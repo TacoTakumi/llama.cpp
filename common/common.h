@@ -602,6 +602,10 @@ struct common_params {
     size_t moe_cache_n_sizes = 0; // number of entries given to --moe-cache-mib, checked against the device count after parsing
     bool   moe_cache_per_device = false;
 
+    size_t vram_lend_max[128] = {0}; // per-device cap in bytes on the VRAM a GPU may lend to another process while serving, --tensor-split order
+    size_t vram_lend_n_max = 0;      // number of entries given to --vram-lend-max-mib, checked against the device count after parsing
+    bool   vram_lend_per_device = false;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

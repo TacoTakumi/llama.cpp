@@ -377,6 +377,9 @@ llama_context::llama_context(
             }
         }
     }
+    if (params.vram_lend_max != nullptr) {
+        cparams.vram_lend_max.assign(params.vram_lend_max, params.vram_lend_max + llama_max_devices());
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -4032,6 +4035,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_split             =*/ nullptr,
+        /*.vram_lend_max               =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4746,4 +4750,44 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+//
+// vram lend
+//
+
+// true when dev is an index into the context's model devices
+static bool llama_vram_lend_dev_valid(const llama_context * ctx, int32_t dev) {
+    return ctx != nullptr && dev >= 0 && (size_t) dev < ctx->get_model().n_devices();
+}
+
+// the expert cache cannot lend yet, so every device reports not lendable
+
+int32_t llama_vram_lendable(llama_context * ctx, int32_t dev, uint64_t * mib) {
+    if (mib != nullptr) {
+        *mib = 0;
+    }
+    if (!llama_vram_lend_dev_valid(ctx, dev)) {
+        return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
+    }
+    return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
+}
+
+int32_t llama_vram_lend(llama_context * ctx, int32_t dev, uint64_t mib, uint64_t * lent_mib) {
+    GGML_UNUSED(mib);
+    if (lent_mib != nullptr) {
+        *lent_mib = 0;
+    }
+    if (!llama_vram_lend_dev_valid(ctx, dev)) {
+        return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
+    }
+    return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
+}
+
+int32_t llama_vram_return(llama_context * ctx, int32_t dev, uint64_t mib) {
+    GGML_UNUSED(mib);
+    if (!llama_vram_lend_dev_valid(ctx, dev)) {
+        return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
+    }
+    return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
 }

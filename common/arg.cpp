@@ -773,6 +773,21 @@ static void common_params_apply_system_config(common_params & params, llama_exam
     }
 }
 
+// one entry of a per-device MiB list: a non-negative integer, returned in bytes
+static size_t parse_mib_entry(const std::string & s) {
+    size_t idx = 0;
+    int v = -1;
+    try {
+        v = std::stoi(s, &idx);
+    } catch (const std::exception &) {
+        idx = 0;
+    }
+    if (idx != s.size() || v < 0) {
+        throw std::invalid_argument(string_format("invalid entry '%s'", s.c_str()));
+    }
+    return (size_t) v * 1024 * 1024;
+}
+
 // number of devices a model load will use: the --device list if given, else the GPUs in the backend registry
 // (integrated GPUs only when there is no discrete GPU, like llama_model_load)
 static size_t get_n_model_devices(const common_params & params) {
@@ -932,6 +947,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (params.moe_cache_n_sizes != n_dev) {
             throw std::invalid_argument(string_format(
                 "error: --moe-cache-mib: got %zu entries, expected %zu (one per device)\n", params.moe_cache_n_sizes, n_dev));
+        }
+    }
+
+    // the same holds for a per-device lend cap list
+    if (params.vram_lend_per_device) {
+        const size_t n_dev = get_n_model_devices(params);
+        if (params.vram_lend_n_max != n_dev) {
+            throw std::invalid_argument(string_format(
+                "error: --vram-lend-max-mib: got %zu entries, expected %zu (one per device)\n", params.vram_lend_n_max, n_dev));
         }
     }
 
@@ -2826,20 +2850,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 );
             }
 
-            auto parse_mib = [](const std::string & s) {
-                size_t idx = 0;
-                int v = -1;
-                try {
-                    v = std::stoi(s, &idx);
-                } catch (const std::exception &) {
-                    idx = 0;
-                }
-                if (idx != s.size() || v < 0) {
-                    throw std::invalid_argument(string_format("invalid entry '%s'", s.c_str()));
-                }
-                return (size_t) v * 1024 * 1024;
-            };
-
             params.moe_cache_size = 0;
             params.moe_cache_n_sizes = split_arg.size();
             params.moe_cache_per_device = split_arg.size() > 1;
@@ -2848,14 +2858,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             if (params.moe_cache_per_device) {
                 for (size_t i = 0; i < split_arg.size(); ++i) {
-                    params.moe_cache_sizes[i] = parse_mib(split_arg[i]);
+                    params.moe_cache_sizes[i] = parse_mib_entry(split_arg[i]);
                     params.moe_cache_size += params.moe_cache_sizes[i];
                 }
             } else {
-                params.moe_cache_size = parse_mib(split_arg[0]);
+                params.moe_cache_size = parse_mib_entry(split_arg[0]);
             }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--vram-lend-max-mib"}, "N0,N1,N2,...",
+        "VRAM in MiB each GPU may lend to another process while serving, from its MoE expert cache. a single value applies to every GPU; a comma-separated list sets each GPU in --tensor-split order (default: 0, no lending)",
+        [](common_params & params, const std::string & value) {
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ value.begin(), value.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.empty() || split_arg.size() >= llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
+                );
+            }
+
+            params.vram_lend_n_max = split_arg.size();
+            params.vram_lend_per_device = split_arg.size() > 1;
+            if (params.vram_lend_per_device) {
+                for (size_t i = 0; i < llama_max_devices(); ++i) {
+                    params.vram_lend_max[i] = i < split_arg.size() ? parse_mib_entry(split_arg[i]) : 0;
+                }
+            } else {
+                const size_t cap = parse_mib_entry(split_arg[0]);
+                for (size_t i = 0; i < llama_max_devices(); ++i) {
+                    params.vram_lend_max[i] = cap;
+                }
+            }
+        }
+    ).set_env("LLAMA_ARG_VRAM_LEND_MAX_MIB"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

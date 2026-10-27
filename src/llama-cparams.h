@@ -59,6 +59,7 @@ struct llama_cparams {
 
     size_t moe_cache_size;
     std::vector<size_t> moe_cache_sizes;
+    std::vector<size_t> vram_lend_max; // per-device cap in bytes on the cache memory a device may lend, empty = no device lends
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

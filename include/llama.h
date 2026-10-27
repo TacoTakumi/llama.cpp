@@ -398,6 +398,7 @@ extern "C" {
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, 0 = disabled [EXPERIMENTAL]
         const size_t * moe_cache_split; // per-device cache sizes in bytes, size: llama_max_devices(), NULL = split moe_cache_size like the layers [EXPERIMENTAL]
+        const size_t * vram_lend_max; // per-device cap in bytes on the cache memory a device may lend to another process, size: llama_max_devices(), NULL = no device lends [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -1666,6 +1667,37 @@ extern "C" {
     ///          llama_split_prefix(split_prefix, 64, "/models/ggml-model-q4_0-00002-of-00004.gguf", 2, 4) => split_prefix = "/models/ggml-model-q4_0"
     //  Returns the split_prefix length.
     LLAMA_API int32_t llama_split_prefix(char * split_prefix, size_t maxlen, const char * split_path, int32_t split_no, int32_t split_count);
+
+    //
+    // VRAM lending [EXPERIMENTAL]
+    //
+    // A context that keeps a device cache for the MoE experts (moe_cache_size, moe_cache_split) can give part
+    // of that cache memory to another process and take it back later. Each device lends at most
+    // llama_context_params.vram_lend_max bytes. The device index dev follows the context's model devices,
+    // the same order as the tensor split. Sizes are in MiB.
+    //
+
+    enum llama_vram_lend_status {
+        LLAMA_VRAM_LEND_STATUS_OK            = 0, // the request was carried out
+        LLAMA_VRAM_LEND_STATUS_OVER_LENDABLE = 1, // the request exceeds what the device can lend now (or has lent, on return)
+        LLAMA_VRAM_LEND_STATUS_BUSY          = 2, // the memory is not available right now, try again later
+        LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE  = 3, // the device does not lend: no cap, no cache, or a bad device index
+        LLAMA_VRAM_LEND_STATUS_FAILED        = 4, // the operation failed, the previous state is kept
+    };
+
+    // Get the amount of memory, in MiB, that device dev can lend now.
+    // *mib receives the amount, 0 when the device cannot lend. mib may be NULL.
+    // Returns a llama_vram_lend_status.
+    LLAMA_API int32_t llama_vram_lendable(struct llama_context * ctx, int32_t dev, uint64_t * mib);
+
+    // Free at least mib MiB of memory on device dev for another process.
+    // *lent_mib receives the amount freed, 0 when nothing was freed. lent_mib may be NULL.
+    // Returns a llama_vram_lend_status.
+    LLAMA_API int32_t llama_vram_lend(struct llama_context * ctx, int32_t dev, uint64_t mib, uint64_t * lent_mib);
+
+    // Take mib MiB of lent memory back on device dev.
+    // Returns a llama_vram_lend_status.
+    LLAMA_API int32_t llama_vram_return(struct llama_context * ctx, int32_t dev, uint64_t mib);
 
     // Print system information
     LLAMA_API const char * llama_print_system_info(void);

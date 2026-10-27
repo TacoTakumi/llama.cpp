@@ -403,6 +403,74 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
     }
 
+    // --vram-lend-max-mib takes the same per-device list as --moe-cache-mib, so the same checks apply
+    {
+        // no cap by default, nothing reaches the context
+        common_params lend_params;
+        argv = {"binary_name", "-m", "dummy.gguf"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), lend_params, LLAMA_EXAMPLE_COMMON));
+        assert(lend_params.vram_lend_per_device == false);
+        assert(lend_params.vram_lend_n_max == 0);
+        assert(common_context_params_to_llama(lend_params).vram_lend_max == nullptr);
+    }
+
+    {
+        // a single value applies to every device
+        common_params lend_params;
+        argv = {"binary_name", "-m", "dummy.gguf", "--vram-lend-max-mib", "64"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), lend_params, LLAMA_EXAMPLE_COMMON));
+        assert(lend_params.vram_lend_per_device == false);
+        assert(lend_params.vram_lend_n_max == 1);
+        for (size_t i = 0; i < llama_max_devices(); ++i) {
+            assert(lend_params.vram_lend_max[i] == (size_t) 64 * 1024 * 1024);
+        }
+        assert(common_context_params_to_llama(lend_params).vram_lend_max == lend_params.vram_lend_max);
+    }
+
+    if (n_gpu_devices >= 2) {
+        // a list sets each device in --tensor-split order
+        common_params lend_params;
+        const std::string list = moe_cache_list(n_gpu_devices);
+        argv = {"binary_name", "-m", "dummy.gguf", "--vram-lend-max-mib", list};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), lend_params, LLAMA_EXAMPLE_COMMON));
+        assert(lend_params.vram_lend_per_device == true);
+        assert(lend_params.vram_lend_n_max == n_gpu_devices);
+        for (size_t i = 0; i < n_gpu_devices; ++i) {
+            assert(lend_params.vram_lend_max[i] == (size_t) 16 * (i + 1) * 1024 * 1024);
+        }
+        assert(lend_params.vram_lend_max[n_gpu_devices] == 0);
+        assert(common_context_params_to_llama(lend_params).vram_lend_max == lend_params.vram_lend_max);
+    }
+
+    {
+        // one entry too many
+        common_params lend_params;
+        const std::string list = moe_cache_list(std::max<size_t>(n_gpu_devices + 1, 2));
+        argv = {"binary_name", "-m", "dummy.gguf", "--vram-lend-max-mib", list};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), lend_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    if (n_gpu_devices >= 3) {
+        // one entry too few
+        common_params lend_params;
+        const std::string list = moe_cache_list(n_gpu_devices - 1);
+        argv = {"binary_name", "-m", "dummy.gguf", "--vram-lend-max-mib", list};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), lend_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    {
+        // a non-number entry is rejected by the parser before the device count is checked
+        common_params lend_params;
+        argv = {"binary_name", "--vram-lend-max-mib", "16,foo"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), lend_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    {
+        common_params lend_params;
+        argv = {"binary_name", "--vram-lend-max-mib", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), lend_params, LLAMA_EXAMPLE_COMMON));
+    }
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
