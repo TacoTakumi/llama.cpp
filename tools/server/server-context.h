@@ -7,11 +7,51 @@
 #include "json.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
+#include <vector>
 
 struct server_context_impl; // private implementation
+
+//
+// VRAM lending
+//
+
+// memory that one lend took from one GPU
+struct server_vram_lease {
+    std::string id;  // decimal, unique for the life of the process
+    int32_t     gpu; // model device index, tensor-split order
+    uint64_t    mib;
+};
+
+// what GET /vram/state reports: the lent total of every device and the open leases, taken under one lock
+// so the leases always agree with the totals
+struct server_vram_snapshot {
+    std::vector<uint64_t>           lent;   // per model device
+    std::vector<server_vram_lease>  leases; // lend order
+};
+
+// the open leases of this server, shared by the HTTP threads
+struct server_vram_leases {
+    // record a lend; returns the new lease
+    server_vram_lease add(int32_t gpu, uint64_t mib);
+
+    // remove the lease with this id; returns false when no open lease has it
+    bool remove(const std::string & id, server_vram_lease & lease);
+
+    // the leases end with the engine, so the table is emptied when the context is destroyed
+    void clear();
+
+    server_vram_snapshot snapshot(size_t n_devices) const;
+
+private:
+    mutable std::mutex mutex;
+    uint64_t next_id = 1;
+    std::vector<server_vram_lease> leases; // lend order
+};
 
 struct server_context_meta {
     std::string build_info;
@@ -136,6 +176,7 @@ struct server_routes {
     server_http_context::handler_t post_systemone;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+    server_http_context::handler_t get_vram_state;
 
     // to be used in router mode
     json get_model_info() const;

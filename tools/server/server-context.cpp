@@ -1027,6 +1027,48 @@ public:
 
     server_decision_context decision;
 
+    // VRAM lending: the open leases, and the PCI address of every model device (empty when it has none)
+    server_vram_leases vram_leases;
+    std::vector<std::string> vram_gpu_names;
+    std::map<std::string, int32_t> vram_gpu_index; // canonical PCI address -> model device index
+
+    // the answer of GET /vram/state, read on the HTTP thread: one entry per model device with a PCI
+    // address, lendable from the engine and lent from the lease table
+    json get_vram_state() const {
+        const server_vram_snapshot snap = vram_leases.snapshot(vram_gpu_names.size());
+
+        json gpus = json::array();
+        for (size_t i = 0; i < vram_gpu_names.size(); ++i) {
+            if (vram_gpu_names[i].empty()) {
+                continue;
+            }
+            uint64_t lendable = 0;
+            if (ctx_tgt != nullptr && llama_vram_lendable(ctx_tgt, (int32_t) i, &lendable) != LLAMA_VRAM_LEND_STATUS_OK) {
+                lendable = 0;
+            }
+            gpus.push_back({
+                {"gpu",      vram_gpu_names[i]},
+                {"lendable", lendable},
+                {"lent",     snap.lent[i]},
+            });
+        }
+
+        json leases = json::array();
+        for (const auto & lease : snap.leases) {
+            const bool known = lease.gpu >= 0 && (size_t) lease.gpu < vram_gpu_names.size();
+            leases.push_back({
+                {"id",  lease.id},
+                {"gpu", known ? vram_gpu_names[lease.gpu] : ""},
+                {"mib", lease.mib},
+            });
+        }
+
+        return json {
+            {"gpus",   gpus},
+            {"leases", leases},
+        };
+    }
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -1129,6 +1171,11 @@ private:
 
         ctx_tgt = nullptr;
         model_tgt = nullptr;
+
+        // the lent memory went back to the driver with the context
+        vram_leases.clear();
+        vram_gpu_names.clear();
+        vram_gpu_index.clear();
 
         mtmd_free(mctx);
         mctx = nullptr;
@@ -1304,6 +1351,9 @@ private:
         }
 
         vocab = llama_model_get_vocab(model_tgt);
+
+        vram_gpu_names = server_model_gpu_names(model_tgt);
+        vram_gpu_index = server_model_gpu_index(vram_gpu_names);
 
         try {
             decision.init(model_tgt);
@@ -5159,6 +5209,50 @@ server_context_meta server_context::get_meta() const {
     };
 }
 
+//
+// VRAM lease table
+//
+
+server_vram_lease server_vram_leases::add(int32_t gpu, uint64_t mib) {
+    std::lock_guard<std::mutex> lock(mutex);
+    server_vram_lease lease;
+    lease.id  = std::to_string(next_id++);
+    lease.gpu = gpu;
+    lease.mib = mib;
+    leases.push_back(lease);
+    return lease;
+}
+
+bool server_vram_leases::remove(const std::string & id, server_vram_lease & lease) {
+    std::lock_guard<std::mutex> lock(mutex);
+    for (auto it = leases.begin(); it != leases.end(); ++it) {
+        if (it->id == id) {
+            lease = *it;
+            leases.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+void server_vram_leases::clear() {
+    std::lock_guard<std::mutex> lock(mutex);
+    leases.clear();
+}
+
+server_vram_snapshot server_vram_leases::snapshot(size_t n_devices) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    server_vram_snapshot snap;
+    snap.lent.assign(n_devices, 0);
+    for (const auto & lease : leases) {
+        if (lease.gpu >= 0 && (size_t) lease.gpu < n_devices) {
+            snap.lent[lease.gpu] += lease.mib;
+        }
+    }
+    snap.leases = leases;
+    return snap;
+}
+
 // generator-like API for HTTP response generation
 // may have bypass_sleep = true if the task does not use ctx_server
 struct server_res_generator : server_res_spipe {
@@ -6564,6 +6658,13 @@ void server_routes::init_routes() {
                 {"output_tokens", 0},
             }},
         });
+        return res;
+    };
+
+    this->get_vram_state = [this](const server_http_req &) {
+        auto res = create_response();
+        // read on the HTTP thread: the lease table has its own lock and the engine answers lendable itself
+        res->ok(ctx_server.get_vram_state());
         return res;
     };
 

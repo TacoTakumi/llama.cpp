@@ -9,7 +9,12 @@
 
 #include "server-common.h"
 
+#include "../../src/llama-ext.h" // staging API: llama_model_n_devices / llama_model_get_device
+
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
+#include <map>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -2272,4 +2277,78 @@ void server_role::notify_to_router(const std::string & state, const json & paylo
     std::lock_guard<std::mutex> lk(mtx_stdout);
     fprintf(cmd_out, "%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
     fflush(cmd_out);
+}
+
+//
+// GPU names for VRAM lending
+//
+
+bool server_pci_addr_parse(const std::string & str, std::string & canonical) {
+    // split into the domain (optional), bus, device and function parts
+    std::string domain = "0000";
+    std::string rest   = str;
+
+    const size_t n_colon = std::count(str.begin(), str.end(), ':');
+    if (n_colon == 2) {
+        const size_t pos = str.find(':');
+        domain = str.substr(0, pos);
+        rest   = str.substr(pos + 1);
+        // NVML writes an 8-digit domain, the upper half is zero
+        if (domain.size() == 8 && domain.compare(0, 4, "0000") == 0) {
+            domain = domain.substr(4);
+        }
+        if (domain.size() != 4) {
+            return false;
+        }
+    } else if (n_colon != 1) {
+        return false;
+    }
+
+    // rest is "bb:dd.f"
+    if (rest.size() != 7 || rest[2] != ':' || rest[5] != '.') {
+        return false;
+    }
+
+    std::string out = domain + ":" + rest;
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (i == 4 || i == 7 || i == 10) {
+            continue; // the separators were checked above
+        }
+        if (!std::isxdigit(static_cast<unsigned char>(out[i]))) {
+            return false;
+        }
+        out[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(out[i])));
+    }
+
+    canonical = out;
+    return true;
+}
+
+std::vector<std::string> server_model_gpu_names(const llama_model * model) {
+    std::vector<std::string> names;
+    const int32_t n_dev = llama_model_n_devices(model);
+    for (int32_t i = 0; i < n_dev; ++i) {
+        std::string name;
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        if (dev != nullptr) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            // ggml-cuda fills device_id with the PCI bus id, "0000:0A:00.0"
+            if (props.device_id != nullptr && !server_pci_addr_parse(props.device_id, name)) {
+                name.clear();
+            }
+        }
+        names.push_back(name);
+    }
+    return names;
+}
+
+std::map<std::string, int32_t> server_model_gpu_index(const std::vector<std::string> & names) {
+    std::map<std::string, int32_t> index;
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (!names[i].empty() && index.find(names[i]) == index.end()) {
+            index[names[i]] = (int32_t) i;
+        }
+    }
+    return index;
 }

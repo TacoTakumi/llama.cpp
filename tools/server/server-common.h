@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -820,3 +821,22 @@ struct server_role {
 private:
     FILE * cmd_out = nullptr; // the stdout the router reads the commands from
 };
+
+//
+// GPU names for VRAM lending
+//
+
+// Parse a PCI address into its canonical form: lower case, a 4-digit domain and the function,
+// as lspci and sysfs show it ("0000:0a:00.0"). Accepted in any letter case:
+//   "0000:0a:00.0"     CUDA
+//   "00000000:0a:00.0" NVML, an 8-digit domain
+//   "0a:00.0"          lspci, no domain
+// Returns false when str is not one of these forms.
+bool server_pci_addr_parse(const std::string & str, std::string & canonical);
+
+// The canonical PCI address of every device of the model, in tensor-split order (the device index that
+// llama_vram_lendable takes). A device without a PCI address (CPU, RPC, a meta device) gets an empty string.
+std::vector<std::string> server_model_gpu_names(const llama_model * model);
+
+// Map from a canonical PCI address to the model device index, built from server_model_gpu_names
+std::map<std::string, int32_t> server_model_gpu_index(const std::vector<std::string> & names);
