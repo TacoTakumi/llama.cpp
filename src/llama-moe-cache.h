@@ -35,6 +35,25 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // VRAM lending: the banks of one device are freed and allocated again with fewer slots, so another process
+    // can use the memory, and later with the old slot count again. A lend moves whole slots, taken from the group
+    // that keeps the largest share of its full size first; every group keeps the slots of one decode step. The
+    // slots start empty after each rebuild. dev is an index into the cache's own devices, sizes are bytes
+
+    // the cache device of a backend device, -1 if it has no cache
+    int32_t device(ggml_backend_dev_t dev) const;
+
+    // bytes the device can lend now: the slots above the working minimum of every group, within cap, in whole slots
+    size_t lendable(int32_t dev, size_t cap) const;
+
+    // free at least bytes (rounded up to whole slots, at most lendable) on the device, the caller has synchronized it
+    // returns the freed bytes, 0 if the smaller buffer could not be allocated (the cache keeps its size)
+    size_t lend(int32_t dev, size_t bytes);
+
+    // take bytes (rounded up to whole slots, at most what is lent) back, the caller has synchronized the device
+    // returns the bytes taken back, 0 if the larger buffer could not be allocated (the cache keeps the lent size)
+    size_t restore(int32_t dev, size_t bytes);
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

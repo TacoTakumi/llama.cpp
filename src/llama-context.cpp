@@ -380,6 +380,7 @@ llama_context::llama_context(
     if (params.vram_lend_max != nullptr) {
         cparams.vram_lend_max.assign(params.vram_lend_max, params.vram_lend_max + llama_max_devices());
     }
+    vram_lent.assign(model.n_devices(), 0);
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -934,6 +935,98 @@ void llama_context::synchronize() {
 
 const llama_model & llama_context::get_model() const {
     return model;
+}
+
+int32_t llama_context::vram_lend_device(int32_t dev) const {
+    if (!moe_cache || dev < 0 || (size_t) dev >= model.n_devices() || (size_t) dev >= cparams.vram_lend_max.size() || cparams.vram_lend_max[dev] == 0) {
+        return -1;
+    }
+    return moe_cache->device(model.devices[dev].dev);
+}
+
+void llama_context::graph_invalidate() {
+    ggml_backend_sched_reset(sched.get());
+
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
+}
+
+int32_t llama_context::vram_lendable(int32_t dev, size_t * bytes) const {
+    if (bytes != nullptr) {
+        *bytes = 0;
+    }
+    const int32_t id = vram_lend_device(dev);
+    if (id < 0) {
+        return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
+    }
+    const size_t cap  = cparams.vram_lend_max[dev];
+    const size_t lent = vram_lent[dev];
+    const size_t res  = moe_cache->lendable(id, cap > lent ? cap - lent : 0);
+    if (bytes != nullptr) {
+        *bytes = res;
+    }
+    return LLAMA_VRAM_LEND_STATUS_OK;
+}
+
+int32_t llama_context::vram_lend(int32_t dev, size_t bytes, size_t * lent) {
+    if (lent != nullptr) {
+        *lent = 0;
+    }
+    const int32_t id = vram_lend_device(dev);
+    if (id < 0) {
+        return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
+    }
+    size_t lendable = 0;
+    vram_lendable(dev, &lendable);
+    if (bytes > lendable) {
+        return LLAMA_VRAM_LEND_STATUS_OVER_LENDABLE;
+    }
+    if (bytes == 0) {
+        return LLAMA_VRAM_LEND_STATUS_OK;
+    }
+
+    // the banks are allocated again whether the lend succeeds or not, the graphs kept for reuse read the old ones
+    synchronize();
+    const size_t res = moe_cache->lend(id, bytes);
+    graph_invalidate();
+    if (res == 0) {
+        return LLAMA_VRAM_LEND_STATUS_FAILED;
+    }
+    vram_lent[dev] += res;
+    if (lent != nullptr) {
+        *lent = res;
+    }
+    return LLAMA_VRAM_LEND_STATUS_OK;
+}
+
+int32_t llama_context::vram_return(int32_t dev, size_t bytes) {
+    const int32_t id = vram_lend_device(dev);
+    if (id < 0) {
+        return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
+    }
+    if (bytes > vram_lent[dev]) {
+        return LLAMA_VRAM_LEND_STATUS_OVER_LENDABLE;
+    }
+    if (bytes == 0) {
+        return LLAMA_VRAM_LEND_STATUS_OK;
+    }
+    // the API counts in MiB, so a return that would leave less than one MiB lent takes everything back
+    if (vram_lent[dev] - bytes < 1024*1024) {
+        bytes = vram_lent[dev];
+    }
+
+    synchronize();
+    const size_t res = moe_cache->restore(id, bytes);
+    graph_invalidate();
+    if (res == 0) {
+        return LLAMA_VRAM_LEND_STATUS_BUSY;
+    }
+    vram_lent[dev] -= std::min(res, vram_lent[dev]);
+    return LLAMA_VRAM_LEND_STATUS_OK;
 }
 
 const llama_cparams & llama_context::get_cparams() const {
@@ -4756,38 +4849,30 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
 // vram lend
 //
 
-// true when dev is an index into the context's model devices
-static bool llama_vram_lend_dev_valid(const llama_context * ctx, int32_t dev) {
-    return ctx != nullptr && dev >= 0 && (size_t) dev < ctx->get_model().n_devices();
-}
-
-// the expert cache cannot lend yet, so every device reports not lendable
+// the API counts in MiB, the context in bytes
+static constexpr uint64_t llama_vram_lend_mib = 1024*1024;
 
 int32_t llama_vram_lendable(llama_context * ctx, int32_t dev, uint64_t * mib) {
+    size_t bytes = 0;
+    const int32_t res = ctx != nullptr ? ctx->vram_lendable(dev, &bytes) : LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
     if (mib != nullptr) {
-        *mib = 0;
+        *mib = bytes/llama_vram_lend_mib;
     }
-    if (!llama_vram_lend_dev_valid(ctx, dev)) {
-        return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
-    }
-    return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
+    return res;
 }
 
 int32_t llama_vram_lend(llama_context * ctx, int32_t dev, uint64_t mib, uint64_t * lent_mib) {
-    GGML_UNUSED(mib);
+    size_t lent = 0;
+    const int32_t res = ctx != nullptr ? ctx->vram_lend(dev, mib*llama_vram_lend_mib, &lent) : LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
     if (lent_mib != nullptr) {
-        *lent_mib = 0;
+        *lent_mib = lent/llama_vram_lend_mib;
     }
-    if (!llama_vram_lend_dev_valid(ctx, dev)) {
-        return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
-    }
-    return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
+    return res;
 }
 
 int32_t llama_vram_return(llama_context * ctx, int32_t dev, uint64_t mib) {
-    GGML_UNUSED(mib);
-    if (!llama_vram_lend_dev_valid(ctx, dev)) {
+    if (ctx == nullptr) {
         return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
     }
-    return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
+    return ctx->vram_return(dev, mib*llama_vram_lend_mib);
 }

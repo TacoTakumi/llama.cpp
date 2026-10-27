@@ -227,6 +227,9 @@ endif()
 
 llama_build(test-llama-archs.cpp)
 
+# needs a MoE model with experts in host memory and a GPU, run by hand: test-vram-lend <model> <n_cpu_moe> <cache_mib,...> <lend_max_mib,...> <dev> [devices]
+llama_build(test-vram-lend.cpp LINK llama)
+
 set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
 file(MAKE_DIRECTORY "${MODEL_DIR}")
 

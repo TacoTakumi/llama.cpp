@@ -60,6 +60,11 @@ struct llama_context {
 
     void synchronize();
 
+    // VRAM lending, see llama_vram_lendable: dev indexes the model devices, sizes are bytes
+    int32_t vram_lendable(int32_t dev, size_t * bytes) const;
+    int32_t vram_lend    (int32_t dev, size_t bytes, size_t * lent);
+    int32_t vram_return  (int32_t dev, size_t bytes);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -273,6 +278,12 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    // the MoE cache device of model device dev, -1 if the device does not lend: no cap, no cache or a bad index
+    int32_t vram_lend_device(int32_t dev) const;
+
+    // drop the graphs kept for reuse, the next decode builds a new one
+    void graph_invalidate();
+
     // create a new backend scheduler for a graph of the specified size and register the callbacks below
     void sched_new(size_t max_nodes, bool parallel);
 
@@ -308,6 +319,9 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    // bytes of MoE cache memory lent per model device
+    std::vector<size_t> vram_lent;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
