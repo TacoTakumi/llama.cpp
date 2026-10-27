@@ -1,5 +1,5 @@
 // lends part of the MoE expert cache of one device while generating, then takes it back
-// usage: test-vram-lend <model.gguf> <n_cpu_moe> <cache_mib,...> <lend_max_mib,...> <dev> [devices] [--cycles N] [--two-leases]
+// usage: test-vram-lend <model.gguf> <n_cpu_moe> <cache_mib,...> <lend_max_mib,...> <dev> [devices] [--cycles N] [--two-leases] [--poll]
 //   n_cpu_moe:    the experts of the first n layers stay in host memory
 //   cache_mib:    MoE cache per model device, comma separated, 0 = none
 //   lend_max_mib: lend cap per model device, comma separated, 0 = the device does not lend
@@ -7,14 +7,21 @@
 //   devices:      comma separated backend device names, e.g. CUDA0, default: all
 //   --cycles N:   N times: generate, lend, generate, decode a long prompt, return, generate (default: one short cycle)
 //   --two-leases: lend 1024 and 512 MiB, return them in both orders by the MiB the API reported, lendable must come back
+//   --poll:       a second thread polls llama_vram_lendable during the lends and returns, every value it sees must be
+//                 one the main thread saw between two operations
 
 #include "llama.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 static std::vector<std::string> split(const char * arg) {
@@ -34,6 +41,58 @@ static std::vector<size_t> parse_mib(const char * arg) {
     }
     return res;
 }
+
+// reads lendable on a second thread as fast as it can and counts the distinct answers
+struct poller {
+    llama_context * ctx = nullptr;
+    int32_t dev = 0;
+    std::atomic<bool> stop{false};
+    std::map<std::pair<int32_t, uint64_t>, size_t> seen; // (status, MiB) -> count
+    std::set<std::pair<int32_t, uint64_t>> expected;     // what the main thread saw between two operations
+    std::thread thread;
+
+    void start(llama_context * ctx_, int32_t dev_) {
+        ctx = ctx_;
+        dev = dev_;
+        thread = std::thread([this] {
+            while (!stop) {
+                uint64_t mib = 0;
+                const int32_t status = llama_vram_lendable(ctx, dev, &mib);
+                seen[{ status, mib }]++;
+            }
+        });
+    }
+
+    // the main thread records a quiet state; it first leaves the poller a window, as a lend or return holds the lock
+    // for the whole rebuild and the main thread would otherwise take it again before the poller wakes up
+    void note(const char * when) {
+        if (!thread.joinable()) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        uint64_t mib = 0;
+        const int32_t status = llama_vram_lendable(ctx, dev, &mib);
+        expected.insert({ status, mib });
+        printf("poll: expected %s: status %d, %llu MiB\n", when, status, (unsigned long long) mib);
+    }
+
+    // stops the thread, prints what it saw, returns false if it saw a value the main thread never saw
+    bool finish() {
+        if (!thread.joinable()) {
+            return true;
+        }
+        stop = true;
+        thread.join();
+        bool ok = true;
+        for (const auto & [value, count] : seen) {
+            const bool known = expected.count(value) > 0;
+            printf("poll: status %d, %5llu MiB seen %7zu times%s\n", value.first, (unsigned long long) value.second, count, known ? "" : " UNEXPECTED");
+            ok &= known;
+        }
+        printf("poll: %zu distinct values, %zu expected states\n", seen.size(), expected.size());
+        return ok;
+    }
+};
 
 // prints the free memory of the device, if one was named
 static void print_free(ggml_backend_dev_t dev, const char * when) {
@@ -109,7 +168,7 @@ static bool phase(llama_context * ctx, const llama_vocab * vocab, const char * n
 
 int main(int argc, char ** argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: %s <model.gguf> <n_cpu_moe> <cache_mib,...> <lend_max_mib,...> <dev> [devices] [--cycles N] [--two-leases]\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> <n_cpu_moe> <cache_mib,...> <lend_max_mib,...> <dev> [devices] [--cycles N] [--two-leases] [--poll]\n", argv[0]);
         return 1;
     }
     const std::vector<size_t> cache_sizes = parse_mib(argv[3]);
@@ -117,12 +176,15 @@ int main(int argc, char ** argv) {
     const int32_t dev = atoi(argv[5]);
     int n_cycles = 0;
     bool two_leases = false;
+    bool poll = false;
     std::vector<std::string> device_names;
     for (int i = 6; i < argc; ++i) {
         if (strcmp(argv[i], "--cycles") == 0 && i + 1 < argc) {
             n_cycles = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--two-leases") == 0) {
             two_leases = true;
+        } else if (strcmp(argv[i], "--poll") == 0) {
+            poll = true;
         } else {
             device_names = split(argv[i]);
         }
@@ -182,6 +244,12 @@ int main(int argc, char ** argv) {
     printf("lendable: status %d, %llu MiB\n", status, (unsigned long long) mib);
     ok &= status == 0;
 
+    poller poll_thread;
+    if (poll && (two_leases || n_cycles > 0)) {
+        poll_thread.start(ctx, dev);
+        poll_thread.note("start");
+    }
+
     if (two_leases) {
         // two leases, returned by the floored MiB the API reported, as a server does; the slots of the two groups differ
         // in size, so a return must not give back more than asked or the other lease can no longer be returned
@@ -192,14 +260,17 @@ int main(int argc, char ** argv) {
             status = llama_vram_lend(ctx, dev, 1024, &lent_a);
             printf("order %d: lend A 1024 MiB: status %d, lent %llu MiB\n", order, status, (unsigned long long) lent_a);
             ok &= status == 0;
+            poll_thread.note("after lend A");
             status = llama_vram_lend(ctx, dev, 512, &lent_b);
             printf("order %d: lend B 512 MiB: status %d, lent %llu MiB\n", order, status, (unsigned long long) lent_b);
             ok &= status == 0;
+            poll_thread.note("after lend B");
             for (int i = 0; i < 2; ++i) {
                 const bool first_a = (i == 0) == (order == 0);
                 status = llama_vram_return(ctx, dev, first_a ? lent_a : lent_b);
                 printf("order %d: return %s %llu MiB: status %d\n", order, first_a ? "A" : "B", (unsigned long long) (first_a ? lent_a : lent_b), status);
                 ok &= status == 0;
+                poll_thread.note(first_a ? "after return A" : "after return B");
             }
             status = llama_vram_lendable(ctx, dev, &mib);
             printf("order %d: lendable after: status %d, %llu MiB (before %llu MiB)\n", order, status, (unsigned long long) mib, (unsigned long long) lendable_before);
@@ -220,6 +291,7 @@ int main(int argc, char ** argv) {
             status = llama_vram_lend(ctx, dev, 1024, &lent);
             printf("lend 1024 MiB: status %d, lent %llu MiB\n", status, (unsigned long long) lent);
             ok &= status == 0;
+            poll_thread.note("after lend");
 
             ok &= phase(ctx, vocab, "gen-lent", prompt, 200, dev_ptr);
             ok &= phase(ctx, vocab, "prompt-lent", prompt_long, 5, dev_ptr);
@@ -227,6 +299,7 @@ int main(int argc, char ** argv) {
             status = llama_vram_return(ctx, dev, lent);
             printf("return %llu MiB: status %d\n", (unsigned long long) lent, status);
             ok &= status == 0;
+            poll_thread.note("after return");
 
             ok &= phase(ctx, vocab, "gen-after", prompt, 200, dev_ptr);
         }
@@ -253,6 +326,8 @@ int main(int argc, char ** argv) {
         ok &= generate(ctx, vocab, tokens, n_past, 50, text);
         printf("%s\n", text.c_str());
     }
+
+    ok &= poll_thread.finish();
 
     status = llama_vram_lendable(ctx, dev, &mib);
     printf("lendable after: status %d, %llu MiB\n", status, (unsigned long long) mib);

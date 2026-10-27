@@ -959,6 +959,12 @@ void llama_context::graph_invalidate() {
     gf_res_prev_active = nullptr;
 }
 
+size_t llama_context::vram_lendable_bytes(int32_t dev, int32_t id) const {
+    const size_t cap  = cparams.vram_lend_max[dev];
+    const size_t lent = vram_lent[dev];
+    return moe_cache->lendable(id, cap > lent ? cap - lent : 0);
+}
+
 int32_t llama_context::vram_lendable(int32_t dev, size_t * bytes) const {
     if (bytes != nullptr) {
         *bytes = 0;
@@ -967,9 +973,8 @@ int32_t llama_context::vram_lendable(int32_t dev, size_t * bytes) const {
     if (id < 0) {
         return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
     }
-    const size_t cap  = cparams.vram_lend_max[dev];
-    const size_t lent = vram_lent[dev];
-    const size_t res  = moe_cache->lendable(id, cap > lent ? cap - lent : 0);
+    std::lock_guard<std::mutex> lock(vram_mutex);
+    const size_t res = vram_lendable_bytes(dev, id);
     if (bytes != nullptr) {
         *bytes = res;
     }
@@ -984,8 +989,8 @@ int32_t llama_context::vram_lend(int32_t dev, size_t bytes, size_t * lent) {
     if (id < 0) {
         return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
     }
-    size_t lendable = 0;
-    vram_lendable(dev, &lendable);
+    std::lock_guard<std::mutex> lock(vram_mutex);
+    const size_t lendable = vram_lendable_bytes(dev, id);
     if (bytes > lendable) {
         return LLAMA_VRAM_LEND_STATUS_OVER_LENDABLE;
     }
@@ -1015,6 +1020,7 @@ int32_t llama_context::vram_return(int32_t dev, size_t bytes) {
     if (id < 0) {
         return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
     }
+    std::lock_guard<std::mutex> lock(vram_mutex);
     if (bytes > vram_lent_reported[dev]) {
         return LLAMA_VRAM_LEND_STATUS_OVER_LENDABLE;
     }

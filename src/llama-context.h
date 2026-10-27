@@ -14,6 +14,7 @@
 
 #include <array>
 #include <map>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
@@ -281,6 +282,9 @@ private:
     // the MoE cache device of model device dev, -1 if the device does not lend: no cap, no cache or a bad index
     int32_t vram_lend_device(int32_t dev) const;
 
+    // bytes model device dev (cache device id) can lend now, the caller holds vram_mutex
+    size_t vram_lendable_bytes(int32_t dev, int32_t id) const;
+
     // drop the graphs kept for reuse, the next decode builds a new one
     void graph_invalidate();
 
@@ -324,6 +328,10 @@ private:
     // which is rounded down to whole MiB. A return gives back whole slots within the asked amount plus that rounding
     std::vector<size_t> vram_lent;
     std::vector<size_t> vram_lent_reported;
+
+    // lendable can be read from another thread while a lend or return rebuilds the cache on this one, so the three
+    // operations hold this lock; decode does not take it
+    mutable std::mutex vram_mutex;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
