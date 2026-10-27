@@ -711,23 +711,26 @@ struct llama_moe_cache::impl {
         return lent;
     }
 
-    size_t restore(int32_t id, size_t bytes) {
-        if (!lend_valid(id) || bytes == 0) {
-            return 0;
+    // a lend rounds up, a return rounds down to the whole slots within cap, so a return never gives back more than
+    // the caller allows; the caller widens cap by the rounding of its own unit so that the last return takes everything
+    bool restore(int32_t id, size_t cap, size_t & returned) {
+        returned = 0;
+        if (!lend_valid(id)) {
+            return false;
         }
         std::vector<int32_t> delta;
-        if (plan(id, 1, bytes, SIZE_MAX, delta) == 0) {
-            return 0;
+        if (plan(id, 1, SIZE_MAX, cap, delta) == 0) {
+            return true;
         }
         const std::string slots_before = slots_str(id);
         const size_t      size_before  = devices[id].buf_size;
         if (!resize_device(id, delta, false)) {
-            return 0;
+            return false;
         }
-        const size_t returned = devices[id].buf_size - size_before;
+        returned = devices[id].buf_size - size_before;
         LLAMA_LOG_INFO("llama_moe_cache: device %d: rebuilt with %s slots per group (was %s), took back %.2f MiB\n",
             id, slots_str(id).c_str(), slots_before.c_str(), returned/1024.0/1024.0);
-        return returned;
+        return true;
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -916,8 +919,8 @@ size_t llama_moe_cache::lend(int32_t dev, size_t bytes) {
     return pimpl->lend(dev, bytes);
 }
 
-size_t llama_moe_cache::restore(int32_t dev, size_t bytes) {
-    return pimpl->restore(dev, bytes);
+bool llama_moe_cache::restore(int32_t dev, size_t cap, size_t & returned) {
+    return pimpl->restore(dev, cap, returned);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

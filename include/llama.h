@@ -1696,6 +1696,9 @@ extern "C" {
     LLAMA_API int32_t llama_vram_lend(struct llama_context * ctx, int32_t dev, uint64_t mib, uint64_t * lent_mib);
 
     // Take mib MiB of lent memory back on device dev.
+    // A lend rounds up to whole cache slots and reports whole MiB; a return gives back whole slots within mib plus
+    // that rounding, never more, so every lend can be returned by the amount it reported, and the return of the last
+    // reported MiB takes back everything that is lent.
     // Returns a llama_vram_lend_status.
     LLAMA_API int32_t llama_vram_return(struct llama_context * ctx, int32_t dev, uint64_t mib);
 

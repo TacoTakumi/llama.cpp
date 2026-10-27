@@ -381,6 +381,7 @@ llama_context::llama_context(
         cparams.vram_lend_max.assign(params.vram_lend_max, params.vram_lend_max + llama_max_devices());
     }
     vram_lent.assign(model.n_devices(), 0);
+    vram_lent_reported.assign(model.n_devices(), 0);
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -937,6 +938,9 @@ const llama_model & llama_context::get_model() const {
     return model;
 }
 
+// the API counts in MiB, the context in bytes
+static constexpr size_t llama_vram_lend_mib = 1024*1024;
+
 int32_t llama_context::vram_lend_device(int32_t dev) const {
     if (!moe_cache || dev < 0 || (size_t) dev >= model.n_devices() || (size_t) dev >= cparams.vram_lend_max.size() || cparams.vram_lend_max[dev] == 0) {
         return -1;
@@ -996,9 +1000,12 @@ int32_t llama_context::vram_lend(int32_t dev, size_t bytes, size_t * lent) {
     if (res == 0) {
         return LLAMA_VRAM_LEND_STATUS_FAILED;
     }
-    vram_lent[dev] += res;
+    // the API counts in MiB, the rounding stays lent and comes back with the last return
+    const size_t reported = res - res % llama_vram_lend_mib;
+    vram_lent[dev]          += res;
+    vram_lent_reported[dev] += reported;
     if (lent != nullptr) {
-        *lent = res;
+        *lent = reported;
     }
     return LLAMA_VRAM_LEND_STATUS_OK;
 }
@@ -1008,24 +1015,26 @@ int32_t llama_context::vram_return(int32_t dev, size_t bytes) {
     if (id < 0) {
         return LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE;
     }
-    if (bytes > vram_lent[dev]) {
+    if (bytes > vram_lent_reported[dev]) {
         return LLAMA_VRAM_LEND_STATUS_OVER_LENDABLE;
     }
     if (bytes == 0) {
         return LLAMA_VRAM_LEND_STATUS_OK;
     }
-    // the API counts in MiB, so a return that would leave less than one MiB lent takes everything back
-    if (vram_lent[dev] - bytes < 1024*1024) {
-        bytes = vram_lent[dev];
-    }
 
+    // whole slots come back, never more than asked plus the MiB rounding of the lends, and what is still reported
+    // as lent stays lent, so every lease can be returned by the amount its lend reported and the last return takes
+    // everything (see llama_moe_cache::restore)
+    const size_t cap = vram_lent[dev] - (vram_lent_reported[dev] - bytes);
     synchronize();
-    const size_t res = moe_cache->restore(id, bytes);
+    size_t returned = 0;
+    const bool ok = moe_cache->restore(id, cap, returned);
     graph_invalidate();
-    if (res == 0) {
+    if (!ok) {
         return LLAMA_VRAM_LEND_STATUS_BUSY;
     }
-    vram_lent[dev] -= std::min(res, vram_lent[dev]);
+    vram_lent[dev]          -= std::min(returned, vram_lent[dev]);
+    vram_lent_reported[dev] -= bytes;
     return LLAMA_VRAM_LEND_STATUS_OK;
 }
 
@@ -4848,9 +4857,6 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
 //
 // vram lend
 //
-
-// the API counts in MiB, the context in bytes
-static constexpr uint64_t llama_vram_lend_mib = 1024*1024;
 
 int32_t llama_vram_lendable(llama_context * ctx, int32_t dev, uint64_t * mib) {
     size_t bytes = 0;

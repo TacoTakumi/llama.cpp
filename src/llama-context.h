@@ -320,8 +320,10 @@ private:
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
 
-    // bytes of MoE cache memory lent per model device
+    // bytes of MoE cache memory lent per model device: the whole slots taken, and the amount reported to the callers,
+    // which is rounded down to whole MiB. A return gives back whole slots within the asked amount plus that rounding
     std::vector<size_t> vram_lent;
+    std::vector<size_t> vram_lent_reported;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

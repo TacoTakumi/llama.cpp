@@ -50,9 +50,11 @@ public:
     // returns the freed bytes, 0 if the smaller buffer could not be allocated (the cache keeps its size)
     size_t lend(int32_t dev, size_t bytes);
 
-    // take bytes (rounded up to whole slots, at most what is lent) back, the caller has synchronized the device
-    // returns the bytes taken back, 0 if the larger buffer could not be allocated (the cache keeps the lent size)
-    size_t restore(int32_t dev, size_t bytes);
+    // take at most cap bytes back, rounded down to whole slots, the caller has synchronized the device. A return never
+    // gives back more than cap: the groups' slots differ in size, so a return that rounded up could take part of the
+    // next lease back and leave that one unreturnable. returned receives the bytes taken back (0 if cap is below one
+    // slot). Returns false if the larger buffer could not be allocated (the cache keeps the lent size)
+    bool restore(int32_t dev, size_t cap, size_t & returned);
 
 private:
     struct impl;

@@ -1,11 +1,12 @@
 // lends part of the MoE expert cache of one device while generating, then takes it back
-// usage: test-vram-lend <model.gguf> <n_cpu_moe> <cache_mib,...> <lend_max_mib,...> <dev> [devices] [--cycles N]
+// usage: test-vram-lend <model.gguf> <n_cpu_moe> <cache_mib,...> <lend_max_mib,...> <dev> [devices] [--cycles N] [--two-leases]
 //   n_cpu_moe:    the experts of the first n layers stay in host memory
 //   cache_mib:    MoE cache per model device, comma separated, 0 = none
 //   lend_max_mib: lend cap per model device, comma separated, 0 = the device does not lend
 //   dev:          the model device to lend from
 //   devices:      comma separated backend device names, e.g. CUDA0, default: all
 //   --cycles N:   N times: generate, lend, generate, decode a long prompt, return, generate (default: one short cycle)
+//   --two-leases: lend 1024 and 512 MiB, return them in both orders by the MiB the API reported, lendable must come back
 
 #include "llama.h"
 
@@ -108,17 +109,20 @@ static bool phase(llama_context * ctx, const llama_vocab * vocab, const char * n
 
 int main(int argc, char ** argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: %s <model.gguf> <n_cpu_moe> <cache_mib,...> <lend_max_mib,...> <dev> [devices] [--cycles N]\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> <n_cpu_moe> <cache_mib,...> <lend_max_mib,...> <dev> [devices] [--cycles N] [--two-leases]\n", argv[0]);
         return 1;
     }
     const std::vector<size_t> cache_sizes = parse_mib(argv[3]);
     const std::vector<size_t> lend_max    = parse_mib(argv[4]);
     const int32_t dev = atoi(argv[5]);
     int n_cycles = 0;
+    bool two_leases = false;
     std::vector<std::string> device_names;
     for (int i = 6; i < argc; ++i) {
         if (strcmp(argv[i], "--cycles") == 0 && i + 1 < argc) {
             n_cycles = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--two-leases") == 0) {
+            two_leases = true;
         } else {
             device_names = split(argv[i]);
         }
@@ -178,7 +182,30 @@ int main(int argc, char ** argv) {
     printf("lendable: status %d, %llu MiB\n", status, (unsigned long long) mib);
     ok &= status == 0;
 
-    if (n_cycles > 0) {
+    if (two_leases) {
+        // two leases, returned by the floored MiB the API reported, as a server does; the slots of the two groups differ
+        // in size, so a return must not give back more than asked or the other lease can no longer be returned
+        const uint64_t lendable_before = mib;
+        for (int order = 0; order < 2 && ok; ++order) {
+            uint64_t lent_a = 0;
+            uint64_t lent_b = 0;
+            status = llama_vram_lend(ctx, dev, 1024, &lent_a);
+            printf("order %d: lend A 1024 MiB: status %d, lent %llu MiB\n", order, status, (unsigned long long) lent_a);
+            ok &= status == 0;
+            status = llama_vram_lend(ctx, dev, 512, &lent_b);
+            printf("order %d: lend B 512 MiB: status %d, lent %llu MiB\n", order, status, (unsigned long long) lent_b);
+            ok &= status == 0;
+            for (int i = 0; i < 2; ++i) {
+                const bool first_a = (i == 0) == (order == 0);
+                status = llama_vram_return(ctx, dev, first_a ? lent_a : lent_b);
+                printf("order %d: return %s %llu MiB: status %d\n", order, first_a ? "A" : "B", (unsigned long long) (first_a ? lent_a : lent_b), status);
+                ok &= status == 0;
+            }
+            status = llama_vram_lendable(ctx, dev, &mib);
+            printf("order %d: lendable after: status %d, %llu MiB (before %llu MiB)\n", order, status, (unsigned long long) mib, (unsigned long long) lendable_before);
+            ok &= status == 0 && mib == lendable_before;
+        }
+    } else if (n_cycles > 0) {
         // a long prompt takes the large-batch path, which reads the cached experts through the copy views
         std::string text;
         std::vector<llama_token> prompt_long;
