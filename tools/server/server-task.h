@@ -31,6 +31,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
+    SERVER_TASK_TYPE_VRAM_LEND,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -223,6 +224,13 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_TTS
     mtmd_helper::gen_audio::inp tts_inp;
+
+    // used by SERVER_TASK_TYPE_VRAM_LEND
+    struct vram_lend {
+        int32_t  gpu = -1; // model device index
+        uint64_t mib = 0;
+    };
+    vram_lend vram_lend;
 
     server_task() = default;
 
@@ -645,6 +653,16 @@ struct server_task_result_get_lora : server_task_result {
 };
 
 struct server_task_result_apply_lora : server_task_result {
+    virtual json to_json() override;
+};
+
+// used by POST /vram/lend: the engine's answer, the HTTP handler maps it to a status code and body
+struct server_task_result_vram_lend : server_task_result {
+    int32_t     status = 0; // llama_vram_lend_status
+    int32_t     gpu    = -1;
+    uint64_t    mib    = 0; // the size lent when the status is OK, otherwise what the device can lend now
+    std::string lease_id;   // set when the status is OK
+
     virtual json to_json() override;
 };
 

@@ -1032,6 +1032,26 @@ public:
     std::vector<std::string> vram_gpu_names;
     std::map<std::string, int32_t> vram_gpu_index; // canonical PCI address -> model device index
 
+    // true when at least one device has a lend cap: without one the server cannot lend at all.
+    // a device whose own cap is 0 while another lends is not this case, it just lends nothing
+    bool vram_can_lend() const {
+        for (size_t i = 0; i < vram_gpu_names.size() && i < llama_max_devices(); ++i) {
+            if (params_base.vram_lend_max[i] > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // what device gpu can lend now in MiB, 0 when it does not lend
+    uint64_t vram_lendable(int32_t gpu) const {
+        uint64_t mib = 0;
+        if (ctx_tgt == nullptr || llama_vram_lendable(ctx_tgt, gpu, &mib) != LLAMA_VRAM_LEND_STATUS_OK) {
+            return 0;
+        }
+        return mib;
+    }
+
     // the answer of GET /vram/state, read on the HTTP thread: one entry per model device with a PCI
     // address, lendable from the engine and lent from the lease table
     json get_vram_state() const {
@@ -1042,13 +1062,9 @@ public:
             if (vram_gpu_names[i].empty()) {
                 continue;
             }
-            uint64_t lendable = 0;
-            if (ctx_tgt != nullptr && llama_vram_lendable(ctx_tgt, (int32_t) i, &lendable) != LLAMA_VRAM_LEND_STATUS_OK) {
-                lendable = 0;
-            }
             gpus.push_back({
                 {"gpu",      vram_gpu_names[i]},
-                {"lendable", lendable},
+                {"lendable", vram_lendable((int32_t) i)},
                 {"lent",     snap.lent[i]},
             });
         }
@@ -3385,6 +3401,39 @@ private:
                     params_base.lora_adapters = new_loras;
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_VRAM_LEND:
+                {
+                    // runs between two update_slots calls, when no graph is in flight on the cache
+                    const int32_t  gpu = task.vram_lend.gpu;
+                    const uint64_t mib = task.vram_lend.mib;
+
+                    auto res = std::make_unique<server_task_result_vram_lend>();
+                    res->id  = task.id;
+                    res->gpu = gpu;
+
+                    // the HTTP thread checked this already, the state can have changed since
+                    const uint64_t lendable = vram_lendable(gpu);
+                    if (mib > lendable) {
+                        res->status = LLAMA_VRAM_LEND_STATUS_OVER_LENDABLE;
+                        res->mib    = lendable;
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    uint64_t lent = 0;
+                    res->status = llama_vram_lend(ctx_tgt, gpu, mib, &lent);
+                    if (res->status == LLAMA_VRAM_LEND_STATUS_OK) {
+                        const server_vram_lease lease = vram_leases.add(gpu, lent);
+                        res->lease_id = lease.id;
+                        res->mib      = lent;
+                        SRV_INF("vram lend: lease %s, device %d, %" PRIu64 " MiB\n", lease.id.c_str(), gpu, lent);
+                    } else {
+                        // nothing was lent, report what the device can lend now
+                        res->mib = vram_lendable(gpu);
+                        SRV_WRN("vram lend: device %d, %" PRIu64 " MiB refused, status %d\n", gpu, mib, res->status);
+                    }
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -6665,6 +6714,121 @@ void server_routes::init_routes() {
         auto res = create_response();
         // read on the HTTP thread: the lease table has its own lock and the engine answers lendable itself
         res->ok(ctx_server.get_vram_state());
+        return res;
+    };
+
+    this->post_vram_lend = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        // the answers of this endpoint carry their own bodies, not the server's error object
+        auto answer = [&res](int status, const json & body) {
+            res->status = status;
+            res->data   = safe_json_to_str(body);
+        };
+        auto fail = [&answer](int status, const std::string & message) {
+            answer(status, json {{"error", message}});
+        };
+
+        // validate the body on the HTTP thread
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception &) {
+            body = nullptr;
+        }
+        if (!body.is_object()) {
+            fail(400, "the body is not a JSON object");
+            return res;
+        }
+        if (!body.contains("mib")) {
+            fail(400, "mib is missing");
+            return res;
+        }
+        const json & mib_val = body.at("mib");
+        if (mib_val.is_boolean() || !mib_val.is_number_integer()) {
+            fail(400, "mib is not a whole number");
+            return res;
+        }
+        const int64_t mib_signed = mib_val.get<int64_t>();
+        if (mib_signed <= 0) {
+            fail(400, "mib is not above 0");
+            return res;
+        }
+        const uint64_t mib = (uint64_t) mib_signed;
+
+        std::string gpu_name;
+        if (!body.contains("gpu") || !body.at("gpu").is_string() || !server_pci_addr_parse(body.at("gpu").get<std::string>(), gpu_name)) {
+            fail(400, "gpu is not a PCI address");
+            return res;
+        }
+        const auto it_gpu = ctx_server.vram_gpu_index.find(gpu_name);
+        if (it_gpu == ctx_server.vram_gpu_index.end()) {
+            fail(400, "gpu is not a GPU of this server");
+            return res;
+        }
+        const int32_t gpu = it_gpu->second;
+
+        if (!ctx_server.vram_can_lend()) {
+            fail(501, "this server does not lend VRAM, start it with --vram-lend-max-mib");
+            return res;
+        }
+
+        // the fast answer; the task checks again, the state can change in between
+        const uint64_t lendable = ctx_server.vram_lendable(gpu);
+        if (mib > lendable) {
+            answer(409, json {{"max_mib", lendable}});
+            return res;
+        }
+
+        // the lend itself runs on the main loop, between two batches
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_VRAM_LEND);
+            task.id = rd.get_new_id();
+            task.vram_lend.gpu = gpu;
+            task.vram_lend.mib = mib;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            // connection was closed
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * lend = dynamic_cast<server_task_result_vram_lend*>(result.get());
+        GGML_ASSERT(lend != nullptr);
+        switch (lend->status) {
+            case LLAMA_VRAM_LEND_STATUS_OK:
+                answer(200, json {
+                    {"id",  lend->lease_id},
+                    {"gpu", gpu_name},
+                    {"mib", lend->mib},
+                });
+                break;
+            case LLAMA_VRAM_LEND_STATUS_OVER_LENDABLE:
+                answer(409, json {{"max_mib", lend->mib}});
+                break;
+            case LLAMA_VRAM_LEND_STATUS_NOT_LENDABLE:
+                answer(409, json {{"max_mib", 0}});
+                break;
+            case LLAMA_VRAM_LEND_STATUS_BUSY:
+                fail(503, "the memory is not available right now, try again later");
+                break;
+            case LLAMA_VRAM_LEND_STATUS_FAILED:
+                fail(503, "the engine could not free the memory, nothing was lent");
+                break;
+            default:
+                // the engine is this process, so an answer the server does not know is a 503 (not a bad gateway)
+                fail(503, "the engine gave an unknown answer: " + std::to_string(lend->status));
+                break;
+        }
         return res;
     };
 

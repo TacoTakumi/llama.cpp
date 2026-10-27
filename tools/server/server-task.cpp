@@ -1720,6 +1720,15 @@ json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
 }
 
+json server_task_result_vram_lend::to_json() {
+    return json {
+        { "status",   status },
+        { "gpu",      gpu },
+        { "mib",      mib },
+        { "lease_id", lease_id },
+    };
+}
+
 //
 // server_prompt_cache
 //

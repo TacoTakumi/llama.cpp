@@ -177,6 +177,7 @@ struct server_routes {
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
     server_http_context::handler_t get_vram_state;
+    server_http_context::handler_t post_vram_lend;
 
     // to be used in router mode
     json get_model_info() const;
