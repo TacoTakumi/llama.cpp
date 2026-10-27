@@ -111,3 +111,43 @@ def test_lend_non_lending_gpu(monkeypatch):
     assert res.status_code == 200
     assert res.body["leases"] == []
     assert all(g["lent"] == 0 for g in res.body["gpus"])
+
+
+@pytest.mark.parametrize("body", [
+    [],                  # the body is not a JSON object
+    {},                  # id missing
+    {"id": "a b"},       # id not one word
+    {"id": ""},          # id empty
+    {"id": True},        # id a boolean
+    {"id": None},        # id null
+    {"id": [1]},         # id an array
+])
+def test_return_bad_request(body):
+    global server
+    server.start()
+    res = server.make_request("POST", "/vram/return", data=body)
+    assert res.status_code == 400
+    assert isinstance(res.body["error"], str)
+    assert res.body["error"] != ""
+
+
+def test_return_no_cap():
+    global server
+    server.start()
+    res = server.make_request("POST", "/vram/return", data={"id": "1"})
+    assert res.status_code == 501
+    assert isinstance(res.body["error"], str)
+
+
+def test_return_unknown_id(monkeypatch):
+    monkeypatch.setenv("LLAMA_ARG_VRAM_LEND_MAX_MIB", "64")
+    global server
+    server.start()
+    # nothing was lent, so no id names a lease; a JSON number is read like the string
+    for lease_id in ["1", 1, "7"]:
+        res = server.make_request("POST", "/vram/return", data={"id": lease_id})
+        assert res.status_code == 404
+        assert isinstance(res.body["error"], str)
+    res = server.make_request("GET", "/vram/state")
+    assert res.status_code == 200
+    assert res.body["leases"] == []

@@ -1729,6 +1729,16 @@ json server_task_result_vram_lend::to_json() {
     };
 }
 
+json server_task_result_vram_return::to_json() {
+    return json {
+        { "found",    found },
+        { "status",   status },
+        { "lease_id", lease_id },
+        { "gpu",      gpu },
+        { "mib",      mib },
+    };
+}
+
 //
 // server_prompt_cache
 //

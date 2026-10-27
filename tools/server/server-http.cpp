@@ -198,7 +198,8 @@ bool server_http_context::init_listener(const common_params & params) {
     });
 
     srv->set_error_handler([](const httplib::Request &, httplib::Response & res) {
-        if (res.status == 404) {
+        // a route that set its own 404 body keeps it; only an unrouted path gets this one
+        if (res.status == 404 && res.body.empty()) {
             res.set_content(
                 safe_json_to_str(json {
                     {"error", {

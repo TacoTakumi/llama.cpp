@@ -1293,6 +1293,59 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 }
 ```
 
+### GET `/vram/state`: Report the VRAM the GPUs can lend
+
+The server can lend part of a GPU's MoE expert cache to another process while it keeps serving. Lending needs an expert cache (`--moe-cache-mib`) and a lend cap on at least one GPU (`--vram-lend-max-mib`). Without a cap every GPU reports 0 and the lend and return endpoints answer 501.
+
+A GPU is named by its PCI address. Requests accept `0000:0a:00.0`, `00000000:0a:00.0` and `0a:00.0` in any letter case; answers use the lower-case form with a 4-digit domain.
+
+**Response format**
+
+Always 200. `gpus` lists every GPU the model uses, in `--tensor-split` order, with what it can lend now and what it has lent, in MiB. `leases` lists the open leases in the order they were lent.
+
+```json
+{
+    "gpus": [
+        {"gpu": "0000:01:00.0", "lendable": 0, "lent": 0},
+        {"gpu": "0000:0a:00.0", "lendable": 2128, "lent": 8192}
+    ],
+    "leases": [
+        {"id": "7", "gpu": "0000:0a:00.0", "mib": 8192}
+    ]
+}
+```
+
+### POST `/vram/lend`: Lend VRAM of one GPU to another process
+
+*Options:*
+
+`gpu`: the PCI address of a GPU the model uses.
+
+`mib`: a whole number of MiB above 0. The lend is rounded up to whole cache blocks, so the lease can be larger than the request.
+
+**Response format**
+
+- 200 `{"id": "7", "gpu": "0000:0a:00.0", "mib": 8192}`: the memory is free for the borrower. `id` names the lease for `/vram/return`.
+- 400 `{"error": "..."}`: the body is not a JSON object, `mib` is missing or not a whole number above 0, or `gpu` is not a PCI address of this server.
+- 409 `{"max_mib": N}`: the request is more than the GPU can lend now; `N` is its lendable, 0 for a GPU that does not lend.
+- 501 `{"error": "..."}`: the server has no lend cap.
+- 503 `{"error": "..."}`: the engine could not free the memory; nothing was lent.
+
+### POST `/vram/return`: Take a lease back
+
+*Options:*
+
+`id`: a lease id as `/vram/lend` answered it. A JSON number is also accepted. A return gives back the whole lease; other leases on the same GPU stay lent.
+
+**Response format**
+
+- 200 `{"id": "7", "gpu": "0000:0a:00.0", "mib": 8192}`: the engine has the memory back.
+- 400 `{"error": "..."}`: the body is not a JSON object, or `id` is missing or not one word.
+- 404 `{"error": "..."}`: no open lease has this id. Leases end with the server process, so an id from before a restart answers 404.
+- 409 `{"error": "...", "retry": true}`: the memory is still in use by another process. The lease stays open; free the memory and return again.
+- 501 `{"error": "..."}`: the server has no lend cap.
+- 503 `{"error": "..."}`: the engine did not take the memory back; the lease stays open.
+
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 
 This endpoint returns the loaded LoRA adapters. You can add adapters using `--lora` when starting the server, for example: `--lora my_adapter_1.gguf --lora my_adapter_2.gguf ...`

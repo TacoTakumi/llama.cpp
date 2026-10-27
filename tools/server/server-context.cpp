@@ -23,6 +23,7 @@
 #include "base64.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cinttypes>
 #include <deque>
@@ -3436,6 +3437,34 @@ private:
                     }
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_VRAM_RETURN:
+                {
+                    // the whole lease goes back; a second return of the same id finds no lease and answers 404
+                    const std::string & id = task.vram_return.id;
+
+                    auto res = std::make_unique<server_task_result_vram_return>();
+                    res->id       = task.id;
+                    res->lease_id = id;
+
+                    server_vram_lease lease;
+                    if (!vram_leases.find(id, lease)) {
+                        res->found = false;
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    res->found  = true;
+                    res->gpu    = lease.gpu;
+                    res->mib    = lease.mib;
+                    res->status = llama_vram_return(ctx_tgt, lease.gpu, lease.mib);
+                    if (res->status == LLAMA_VRAM_LEND_STATUS_OK) {
+                        vram_leases.remove(id, lease);
+                        SRV_INF("vram return: lease %s, device %d, %" PRIu64 " MiB\n", id.c_str(), lease.gpu, lease.mib);
+                    } else {
+                        // the lease stays open, the memory is still out
+                        SRV_WRN("vram return: lease %s, device %d, %" PRIu64 " MiB refused, status %d\n", id.c_str(), lease.gpu, lease.mib, res->status);
+                    }
+                    queue_results.send(std::move(res));
+                } break;
         }
 
         return true;
@@ -5272,6 +5301,17 @@ server_vram_lease server_vram_leases::add(int32_t gpu, uint64_t mib) {
     return lease;
 }
 
+bool server_vram_leases::find(const std::string & id, server_vram_lease & lease) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    for (const auto & it : leases) {
+        if (it.id == id) {
+            lease = it;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool server_vram_leases::remove(const std::string & id, server_vram_lease & lease) {
     std::lock_guard<std::mutex> lock(mutex);
     for (auto it = leases.begin(); it != leases.end(); ++it) {
@@ -6827,6 +6867,112 @@ void server_routes::init_routes() {
             default:
                 // the engine is this process, so an answer the server does not know is a 503 (not a bad gateway)
                 fail(503, "the engine gave an unknown answer: " + std::to_string(lend->status));
+                break;
+        }
+        return res;
+    };
+
+    this->post_vram_return = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        auto answer = [&res](int status, const json & body) {
+            res->status = status;
+            res->data   = safe_json_to_str(body);
+        };
+        auto fail = [&answer](int status, const std::string & message) {
+            answer(status, json {{"error", message}});
+        };
+
+        // validate the body on the HTTP thread
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception &) {
+            body = nullptr;
+        }
+        if (!body.is_object()) {
+            fail(400, "the body is not a JSON object");
+            return res;
+        }
+        if (!body.contains("id")) {
+            fail(400, "id is missing");
+            return res;
+        }
+        // one word: a non-empty string without whitespace, or a JSON whole number
+        const json & id_val = body.at("id");
+        std::string id;
+        if (id_val.is_string()) {
+            id = id_val.get<std::string>();
+            const bool has_space = std::any_of(id.begin(), id.end(), [](unsigned char c) { return std::isspace(c) != 0; });
+            if (id.empty() || has_space) {
+                fail(400, "id is not one word");
+                return res;
+            }
+        } else if (!id_val.is_boolean() && id_val.is_number_integer()) {
+            id = std::to_string(id_val.get<int64_t>());
+        } else {
+            fail(400, "id is not one word");
+            return res;
+        }
+
+        if (!ctx_server.vram_can_lend()) {
+            fail(501, "this server does not lend VRAM, start it with --vram-lend-max-mib");
+            return res;
+        }
+
+        // the fast answer; the task looks again, two returns of one id can race
+        server_vram_lease lease;
+        if (!ctx_server.vram_leases.find(id, lease)) {
+            fail(404, "no open lease has id " + id);
+            return res;
+        }
+
+        // the return itself runs on the main loop, between two batches
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_VRAM_RETURN);
+            task.id = rd.get_new_id();
+            task.vram_return.id = id;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            // connection was closed
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * ret = dynamic_cast<server_task_result_vram_return*>(result.get());
+        GGML_ASSERT(ret != nullptr);
+        if (!ret->found) {
+            fail(404, "no open lease has id " + id);
+            return res;
+        }
+        const bool known_gpu = ret->gpu >= 0 && (size_t) ret->gpu < ctx_server.vram_gpu_names.size();
+        switch (ret->status) {
+            case LLAMA_VRAM_LEND_STATUS_OK:
+                answer(200, json {
+                    {"id",  ret->lease_id},
+                    {"gpu", known_gpu ? ctx_server.vram_gpu_names[ret->gpu] : ""},
+                    {"mib", ret->mib},
+                });
+                break;
+            case LLAMA_VRAM_LEND_STATUS_BUSY:
+                // the borrower still holds the memory; the lease stays open
+                answer(409, json {
+                    {"error", "the memory is still in use by another process, free it and return again"},
+                    {"retry", true},
+                });
+                break;
+            default:
+                // the lease stays open; the engine is this process, so its answer is a 503 (not a bad gateway)
+                fail(503, "the engine did not take the memory back, status " + std::to_string(ret->status));
                 break;
         }
         return res;

@@ -39,6 +39,9 @@ struct server_vram_leases {
     // record a lend; returns the new lease
     server_vram_lease add(int32_t gpu, uint64_t mib);
 
+    // copy the lease with this id; returns false when no open lease has it
+    bool find(const std::string & id, server_vram_lease & lease) const;
+
     // remove the lease with this id; returns false when no open lease has it
     bool remove(const std::string & id, server_vram_lease & lease);
 
@@ -178,6 +181,7 @@ struct server_routes {
     server_http_context::handler_t post_lora_adapters;
     server_http_context::handler_t get_vram_state;
     server_http_context::handler_t post_vram_lend;
+    server_http_context::handler_t post_vram_return;
 
     // to be used in router mode
     json get_model_info() const;

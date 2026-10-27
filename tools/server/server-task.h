@@ -32,6 +32,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
     SERVER_TASK_TYPE_VRAM_LEND,
+    SERVER_TASK_TYPE_VRAM_RETURN,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -231,6 +232,12 @@ struct server_task {
         uint64_t mib = 0;
     };
     vram_lend vram_lend;
+
+    // used by SERVER_TASK_TYPE_VRAM_RETURN
+    struct vram_return {
+        std::string id; // lease id
+    };
+    vram_return vram_return;
 
     server_task() = default;
 
@@ -662,6 +669,17 @@ struct server_task_result_vram_lend : server_task_result {
     int32_t     gpu    = -1;
     uint64_t    mib    = 0; // the size lent when the status is OK, otherwise what the device can lend now
     std::string lease_id;   // set when the status is OK
+
+    virtual json to_json() override;
+};
+
+// used by POST /vram/return: the engine's answer for the whole lease
+struct server_task_result_vram_return : server_task_result {
+    bool        found  = false; // false when no open lease had the id
+    int32_t     status = 0;     // llama_vram_lend_status, set when found
+    std::string lease_id;
+    int32_t     gpu    = -1;
+    uint64_t    mib    = 0;
 
     virtual json to_json() override;
 };
