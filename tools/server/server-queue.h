@@ -183,6 +183,9 @@ public:
     // if timeout is reached, nullptr is returned
     server_task_result_ptr recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout);
 
+    // same as recv_with_timeout(), with the timeout in milliseconds; 0 only looks at the results already there
+    server_task_result_ptr recv_with_timeout_ms(const std::unordered_set<int> & id_tasks, int64_t timeout_ms);
+
     // single-task version of recv()
     server_task_result_ptr recv(int id_task);
 
@@ -232,6 +235,9 @@ struct server_response_reader {
     // note: if one error is received, it will stop further processing and return error result
     server_task_result_ptr next(const std::function<bool()> & should_stop);
 
+    // same as next(), but gives up after timeout_ms milliseconds and returns nullptr; 0 only looks at the results already there
+    server_task_result_ptr next_with_timeout(const std::function<bool()> & should_stop, int64_t timeout_ms);
+
     struct batch_response {
         bool is_terminated = false; // if true, indicates that processing was stopped before all results were received
         std::vector<server_task_result_ptr> results;
@@ -241,4 +247,8 @@ struct server_response_reader {
     batch_response wait_for_all(const std::function<bool()> & should_stop);
 
     void stop();
+
+private:
+    // the bookkeeping of a result that arrived: error stop, generation state, received count
+    server_task_result_ptr received(server_task_result_ptr && result);
 };

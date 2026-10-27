@@ -605,6 +605,7 @@ struct common_params {
     size_t vram_lend_max[128] = {0}; // per-device cap in bytes on the VRAM a GPU may lend to another process while serving, --tensor-split order
     size_t vram_lend_n_max = 0;      // number of entries given to --vram-lend-max-mib, checked against the device count after parsing
     bool   vram_lend_per_device = false;
+    int32_t vram_lend_wait_ms = 30000; // how long a VRAM lend request waits for the engine; past it the request answers 503 and a lend that completes later is returned by the server itself
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

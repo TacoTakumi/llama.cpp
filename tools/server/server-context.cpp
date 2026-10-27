@@ -1030,6 +1030,30 @@ public:
 
     // VRAM lending: the open leases, and the PCI address of every model device (empty when it has none)
     server_vram_leases vram_leases;
+
+    // lend tasks whose HTTP call stopped waiting; whoever sees such a lend complete returns its lease by itself,
+    // because the borrower was told 503 and must not use the memory
+    std::mutex mutex_vram_orphans;
+    std::set<int> vram_orphans;
+
+    void vram_orphan_mark(int id_task) {
+        std::lock_guard<std::mutex> lock(mutex_vram_orphans);
+        vram_orphans.insert(id_task);
+    }
+
+    // true when the lend was marked; the mark is consumed, so exactly one side acts on it
+    bool vram_orphan_take(int id_task) {
+        std::lock_guard<std::mutex> lock(mutex_vram_orphans);
+        return vram_orphans.erase(id_task) > 0;
+    }
+
+    // give a lease back without a caller: a return task nobody waits for, logged by the task itself
+    void vram_post_self_return(const std::string & lease_id) {
+        server_task task(SERVER_TASK_TYPE_VRAM_RETURN);
+        task.id = queue_tasks.get_new_id();
+        task.vram_return.id = lease_id;
+        queue_tasks.post(std::move(task));
+    }
     std::vector<std::string> vram_gpu_names;
     std::map<std::string, int32_t> vram_gpu_index; // canonical PCI address -> model device index
 
@@ -3425,8 +3449,10 @@ private:
 
                     uint64_t lent = 0;
                     res->status = llama_vram_lend(ctx_tgt, gpu, mib, &lent);
+                    std::string lease_id;
                     if (res->status == LLAMA_VRAM_LEND_STATUS_OK) {
                         const server_vram_lease lease = vram_leases.add(gpu, lent);
+                        lease_id      = lease.id;
                         res->lease_id = lease.id;
                         res->mib      = lent;
                         SRV_INF("vram lend: lease %s, device %d, %" PRIu64 " MiB\n", lease.id.c_str(), gpu, lent);
@@ -3435,7 +3461,14 @@ private:
                         res->mib = vram_lendable(gpu);
                         SRV_WRN("vram lend: device %d, %" PRIu64 " MiB refused, status %d\n", gpu, mib, res->status);
                     }
+                    const int id_task = task.id;
+                    // send first, then look for the orphan mark: a call that stops waiting marks and then looks
+                    // for the result, so one of the two sides always sees both the result and the mark
                     queue_results.send(std::move(res));
+                    if (vram_orphan_take(id_task) && !lease_id.empty()) {
+                        SRV_WRN("vram lend: lease %s was answered 503 already, returning it\n", lease_id.c_str());
+                        vram_post_self_return(lease_id);
+                    }
                 } break;
             case SERVER_TASK_TYPE_VRAM_RETURN:
                 {
@@ -6822,18 +6855,30 @@ void server_routes::init_routes() {
 
         // the lend itself runs on the main loop, between two batches
         auto & rd = res->rd;
+        const int id_task = rd.get_new_id();
         {
             server_task task(SERVER_TASK_TYPE_VRAM_LEND);
-            task.id = rd.get_new_id();
+            task.id = id_task;
             task.vram_lend.gpu = gpu;
             task.vram_lend.mib = mib;
             rd.post_task(std::move(task));
         }
 
-        auto result = rd.next(req.should_stop);
+        auto result = rd.next_with_timeout(req.should_stop, params.vram_lend_wait_ms);
         if (!result) {
-            // connection was closed
-            GGML_ASSERT(req.should_stop());
+            // the wait is over, or the connection was closed: the borrower gets no lease. a lend still queued is
+            // dropped when this reader ends; one that runs now is an orphan and its lease goes back by itself
+            ctx_server.vram_orphan_mark(id_task);
+            // the result can have arrived between the wait and the mark; then this side takes the mark and acts
+            result = rd.next_with_timeout(req.should_stop, 0);
+            if (result && ctx_server.vram_orphan_take(id_task)) {
+                auto * lend = dynamic_cast<server_task_result_vram_lend*>(result.get());
+                if (lend != nullptr && lend->status == LLAMA_VRAM_LEND_STATUS_OK) {
+                    SRV_WRN("vram lend: lease %s completed after the wait, returning it\n", lend->lease_id.c_str());
+                    ctx_server.vram_post_self_return(lend->lease_id);
+                }
+            }
+            fail(503, "the lend did not complete within " + std::to_string(params.vram_lend_wait_ms) + " ms");
             return res;
         }
 

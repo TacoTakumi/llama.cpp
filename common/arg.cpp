@@ -2894,6 +2894,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_VRAM_LEND_MAX_MIB"));
     add_opt(common_arg(
+        {"--vram-lend-wait-ms"}, "N",
+        string_format("how long a VRAM lend request waits for the engine, in ms. past it the request answers 503 and a lend that completes later is returned by the server itself (default: %d)", params.vram_lend_wait_ms),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--vram-lend-wait-ms must be above 0");
+            }
+            params.vram_lend_wait_ms = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VRAM_LEND_WAIT_MS"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

@@ -448,7 +448,11 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
 }
 
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
+    return recv_with_timeout_ms(id_tasks, (int64_t) timeout * 1000);
+}
+
+server_task_result_ptr server_response::recv_with_timeout_ms(const std::unordered_set<int> & id_tasks, int64_t timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
 
@@ -542,6 +546,39 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, const
     queue_tasks.post(std::move(tasks), front);
 }
 
+server_task_result_ptr server_response_reader::received(server_task_result_ptr && result) {
+    if (result->is_error()) {
+        stop(); // cancel remaining tasks
+        SRV_DBG("%s", "received error result, stopping further processing\n");
+        return std::move(result);
+    }
+    if (!states.empty()) {
+        // update the generation state if needed
+        const size_t idx = result->index;
+        GGML_ASSERT(idx < states.size());
+        result->update(states[idx]);
+    }
+    if (result->is_stop()) {
+        received_count++;
+    }
+    return std::move(result);
+}
+
+server_task_result_ptr server_response_reader::next_with_timeout(const std::function<bool()> & should_stop, int64_t timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    const int64_t step_ms = (int64_t) polling_interval_seconds * 1000;
+    while (true) {
+        const int64_t remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        server_task_result_ptr result = queue_results.recv_with_timeout_ms(id_tasks, std::max<int64_t>(0, std::min(step_ms, remaining_ms)));
+        if (result != nullptr) {
+            return received(std::move(result));
+        }
+        if (remaining_ms <= 0 || should_stop()) {
+            return nullptr;
+        }
+    }
+}
+
 bool server_response_reader::has_next() const {
     return !cancelled && received_count < id_tasks.size();
 }
@@ -557,21 +594,7 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
                 return nullptr;
             }
         } else {
-            if (result->is_error()) {
-                stop(); // cancel remaining tasks
-                SRV_DBG("%s", "received error result, stopping further processing\n");
-                return result;
-            }
-            if (!states.empty()) {
-                // update the generation state if needed
-                const size_t idx = result->index;
-                GGML_ASSERT(idx < states.size());
-                result->update(states[idx]);
-            }
-            if (result->is_stop()) {
-                received_count++;
-            }
-            return result;
+            return received(std::move(result));
         }
     }
 
